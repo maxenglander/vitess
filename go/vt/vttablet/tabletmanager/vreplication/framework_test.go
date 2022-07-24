@@ -530,7 +530,6 @@ func expectDBClientQueries(t *testing.T, queries []string, skippableOnce ...stri
 					goto retry
 				}
 			}
-			require.True(t, match, "log:\n%q, does not match log %d:\n%q", got, i, query)
 
 			if !queryMatch(query, got) {
 				if !skippedOnce {

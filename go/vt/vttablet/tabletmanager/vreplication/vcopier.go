@@ -29,6 +29,7 @@ import (
 	"vitess.io/vitess/go/vt/vterrors"
 
 	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/bytes2"
 
@@ -457,9 +458,12 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 			}
 			insert = true
 		} else {
+			// Copy rows so that we can safely process it asynchronously.
+			// Otherwise values will be overwritten by subsequent loops.
+			rowsCopy := proto.Clone(rows).(*binlogdatapb.VStreamRowsResponse)
 			batch := &BatchInfo{
-				rows:      rows.Rows,
-				lastpk:    rows.Lastpk,
+				rows:      rowsCopy.Rows,
+				lastpk:    rowsCopy.Lastpk,
 				ch:        make(chan error, 1),
 				sqlbuffer: &bytes2.Buffer{},
 			}

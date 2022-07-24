@@ -1017,7 +1017,7 @@ func TestPlayerCopyWildcardTableContinuation(t *testing.T) {
 // enabling the optimize inserts functionality
 func TestPlayerCopyWildcardTableContinuationWithOptimizeInserts(t *testing.T) {
 	oldVreplicationExperimentalFlags := *vreplicationExperimentalFlags
-	*vreplicationExperimentalFlags = vreplicationExperimentalOptimizeInserts
+	*vreplicationExperimentalFlags = vreplicationExperimentalFlagOptimizeInserts
 	defer func() {
 		*vreplicationExperimentalFlags = oldVreplicationExperimentalFlags
 	}()
@@ -1293,13 +1293,12 @@ func TestPlayerCopyTablesParallelized(t *testing.T) {
 	oldVreplicationParallelBulkInserts := vreplicationParallelBulkInserts
 	*vreplicationParallelBulkInserts = 2
 
-	oldPacketSize := *vstreamer.PacketSize
-	*vstreamer.PacketSize = 1
+	resetPacketSize := vstreamer.AdjustPacketSize(1)
 
 	defer func() {
 		*vreplicationExperimentalFlags = oldVreplicationExperimentalFlags
 		vreplicationParallelBulkInserts = oldVreplicationParallelBulkInserts
-		*vstreamer.PacketSize = oldPacketSize
+		resetPacketSize()
 	}()
 
 	defer deleteTablet(addTablet(100))
