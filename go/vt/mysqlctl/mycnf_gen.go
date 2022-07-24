@@ -64,7 +64,7 @@ var (
 // mysqldPort needs to be unique per instance per machine.
 func NewMycnf(tabletUID uint32, mysqlPort int32) *Mycnf {
 	cnf := new(Mycnf)
-	cnf.path = MycnfFile(tabletUID)
+	cnf.Path = MycnfFile(tabletUID)
 	tabletDir := TabletDir(tabletUID)
 	cnf.ServerID = tabletUID
 	cnf.MysqlPort = mysqlPort
@@ -84,6 +84,8 @@ func NewMycnf(tabletUID uint32, mysqlPort int32) *Mycnf {
 	cnf.MasterInfoFile = path.Join(tabletDir, "master.info")
 	cnf.PidFile = path.Join(tabletDir, "mysql.pid")
 	cnf.TmpDir = path.Join(tabletDir, "tmp")
+	// by default the secure-file-priv path is `tmp`
+	cnf.SecureFilePriv = cnf.TmpDir
 	return cnf
 }
 

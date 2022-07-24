@@ -17,16 +17,17 @@ limitations under the License.
 package vtgate
 
 import (
+	"context"
 	"fmt"
 	"testing"
+
+	"vitess.io/vitess/go/vt/sqlparser"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 
 	"vitess.io/vitess/go/test/utils"
 
 	"vitess.io/vitess/go/vt/vterrors"
-
-	"context"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/vtgate/vschemaacl"
@@ -89,10 +90,10 @@ func TestExecutorSet(t *testing.T) {
 		out: &vtgatepb.Session{},
 	}, {
 		in:  "set AUTOCOMMIT = 'aa'",
-		err: "Variable 'autocommit' can't be set to the value: 'aa' is not a boolean",
+		err: "variable 'autocommit' can't be set to the value: 'aa' is not a boolean",
 	}, {
 		in:  "set autocommit = 2",
-		err: "Variable 'autocommit' can't be set to the value: 2 is not a boolean",
+		err: "variable 'autocommit' can't be set to the value: 2 is not a boolean",
 	}, {
 		in:  "set client_found_rows = 1",
 		out: &vtgatepb.Session{Autocommit: true, Options: &querypb.ExecuteOptions{ClientFoundRows: true}},
@@ -107,13 +108,13 @@ func TestExecutorSet(t *testing.T) {
 		out: &vtgatepb.Session{Autocommit: true, Options: &querypb.ExecuteOptions{}},
 	}, {
 		in:  "set global @@session.client_found_rows = 1",
-		err: "cannot use scope and @@",
+		err: "syntax error at position 39 near 'session.client_found_rows'",
 	}, {
 		in:  "set client_found_rows = 'aa'",
-		err: "Variable 'client_found_rows' can't be set to the value: 'aa' is not a boolean",
+		err: "variable 'client_found_rows' can't be set to the value: 'aa' is not a boolean",
 	}, {
 		in:  "set client_found_rows = 2",
-		err: "Variable 'client_found_rows' can't be set to the value: 2 is not a boolean",
+		err: "variable 'client_found_rows' can't be set to the value: 2 is not a boolean",
 	}, {
 		in:  "set transaction_mode = 'unspecified'",
 		out: &vtgatepb.Session{Autocommit: true, TransactionMode: vtgatepb.TransactionMode_UNSPECIFIED},
@@ -134,7 +135,7 @@ func TestExecutorSet(t *testing.T) {
 		err: "invalid transaction_mode: aa",
 	}, {
 		in:  "set transaction_mode = 1",
-		err: "Incorrect argument type to variable 'transaction_mode': INT64",
+		err: "incorrect argument type to variable 'transaction_mode': INT64",
 	}, {
 		in:  "set workload = 'unspecified'",
 		out: &vtgatepb.Session{Autocommit: true, Options: &querypb.ExecuteOptions{Workload: querypb.ExecuteOptions_UNSPECIFIED}},
@@ -152,7 +153,7 @@ func TestExecutorSet(t *testing.T) {
 		err: "invalid workload: aa",
 	}, {
 		in:  "set workload = 1",
-		err: "Incorrect argument type to variable 'workload': INT64",
+		err: "incorrect argument type to variable 'workload': INT64",
 	}, {
 		in:  "set transaction_mode = 'twopc', autocommit=1",
 		out: &vtgatepb.Session{Autocommit: true, TransactionMode: vtgatepb.TransactionMode_TWOPC},
@@ -164,10 +165,10 @@ func TestExecutorSet(t *testing.T) {
 		out: &vtgatepb.Session{Autocommit: true, Options: &querypb.ExecuteOptions{SqlSelectLimit: 0}},
 	}, {
 		in:  "set sql_select_limit = 'asdfasfd'",
-		err: "Incorrect argument type to variable 'sql_select_limit': VARBINARY",
+		err: "incorrect argument type to variable 'sql_select_limit': VARCHAR",
 	}, {
 		in:  "set autocommit = 1+1",
-		err: "Variable 'autocommit' can't be set to the value: 2 is not a boolean",
+		err: "variable 'autocommit' can't be set to the value: 2 is not a boolean",
 	}, {
 		in:  "set autocommit = 1+0",
 		out: &vtgatepb.Session{Autocommit: true},
@@ -176,13 +177,13 @@ func TestExecutorSet(t *testing.T) {
 		out: &vtgatepb.Session{Autocommit: true},
 	}, {
 		in:  "set foo = 1",
-		err: "Unknown system variable 'session foo = 1'",
+		err: "Unknown system variable '@@foo = 1'",
 	}, {
 		in:  "set names utf8",
 		out: &vtgatepb.Session{Autocommit: true},
 	}, {
 		in:  "set names ascii",
-		err: "unexpected value for charset/names: ascii",
+		err: "charset/name ascii is not supported",
 	}, {
 		in:  "set charset utf8",
 		out: &vtgatepb.Session{Autocommit: true},
@@ -191,7 +192,7 @@ func TestExecutorSet(t *testing.T) {
 		out: &vtgatepb.Session{Autocommit: true},
 	}, {
 		in:  "set character set ascii",
-		err: "unexpected value for charset/names: ascii",
+		err: "charset/name ascii is not supported",
 	}, {
 		in:  "set skip_query_plan_cache = 1",
 		out: &vtgatepb.Session{Autocommit: true, Options: &querypb.ExecuteOptions{SkipQueryPlanCache: true}},
@@ -200,10 +201,10 @@ func TestExecutorSet(t *testing.T) {
 		out: &vtgatepb.Session{Autocommit: true, Options: &querypb.ExecuteOptions{}},
 	}, {
 		in:  "set tx_read_only = 2",
-		err: "Variable 'tx_read_only' can't be set to the value: 2 is not a boolean",
+		err: "variable 'tx_read_only' can't be set to the value: 2 is not a boolean",
 	}, {
 		in:  "set transaction_read_only = 2",
-		err: "Variable 'transaction_read_only' can't be set to the value: 2 is not a boolean",
+		err: "variable 'transaction_read_only' can't be set to the value: 2 is not a boolean",
 	}, {
 		in:  "set session transaction isolation level repeatable read",
 		out: &vtgatepb.Session{Autocommit: true},
@@ -248,7 +249,7 @@ func TestExecutorSet(t *testing.T) {
 		out: &vtgatepb.Session{Autocommit: true, EnableSystemSettings: false},
 	}, {
 		in:  "set @@socket = '/tmp/change.sock'",
-		err: "Variable 'socket' is a read only variable",
+		err: "variable 'socket' is a read only variable",
 	}}
 	for i, tcase := range testcases {
 		t.Run(fmt.Sprintf("%d-%s", i, tcase.in), func(t *testing.T) {
@@ -265,7 +266,7 @@ func TestExecutorSet(t *testing.T) {
 }
 
 func TestExecutorSetOp(t *testing.T) {
-	executor, _, _, sbclookup := createLegacyExecutorEnv()
+	executor, _, _, sbclookup := createExecutorEnv()
 	*sysVarSetEnabled = true
 
 	returnResult := func(columnName, typ, value string) *sqltypes.Result {
@@ -286,7 +287,7 @@ func TestExecutorSetOp(t *testing.T) {
 	}, {
 		in:      "set sql_mode = 'STRICT_ALL_TABLES,NO_AUTO_UPDATES'",
 		sysVars: map[string]string{"sql_mode": "'STRICT_ALL_TABLES,NO_AUTO_UPDATES'"},
-		result:  returnResult("sql_mode", "varchar", "STRICT_ALL_TABLES,NO_AUTO_UPDATES"),
+		result:  sqltypes.MakeTestResult(sqltypes.MakeTestFields("orig|new", "varchar|varchar"), "|STRICT_ALL_TABLES,NO_AUTO_UPDATES"),
 	}, {
 		// even though the tablet is saying that the value has changed,
 		// useReservedConn is false, so we won't allow this change
@@ -349,7 +350,7 @@ func TestExecutorSetOp(t *testing.T) {
 	}}
 	for _, tcase := range testcases {
 		t.Run(tcase.in, func(t *testing.T) {
-			session := NewAutocommitSession(masterSession)
+			session := NewAutocommitSession(primarySession)
 			session.TargetString = KsTestUnsharded
 			session.EnableSystemSettings = !tcase.disallowResConn
 			sbclookup.SetResults([]*sqltypes.Result{tcase.result})
@@ -367,8 +368,8 @@ func TestExecutorSetOp(t *testing.T) {
 }
 
 func TestExecutorSetMetadata(t *testing.T) {
-	executor, _, _, _ := createLegacyExecutorEnv()
-	session := NewSafeSession(&vtgatepb.Session{TargetString: "@master", Autocommit: true})
+	executor, _, _, _ := createExecutorEnv()
+	session := NewSafeSession(&vtgatepb.Session{TargetString: "@primary", Autocommit: true})
 
 	set := "set @@vitess_metadata.app_keyspace_v1= '1'"
 	_, err := executor.Execute(context.Background(), "TestExecute", session, set, nil)
@@ -379,8 +380,8 @@ func TestExecutorSetMetadata(t *testing.T) {
 		*vschemaacl.AuthorizedDDLUsers = ""
 	}()
 
-	executor, _, _, _ = createLegacyExecutorEnv()
-	session = NewSafeSession(&vtgatepb.Session{TargetString: "@master", Autocommit: true})
+	executor, _, _, _ = createExecutorEnv()
+	session = NewSafeSession(&vtgatepb.Session{TargetString: "@primary", Autocommit: true})
 
 	set = "set @@vitess_metadata.app_keyspace_v1= '1'"
 	_, err = executor.Execute(context.Background(), "TestExecute", session, set, nil)
@@ -424,7 +425,7 @@ func TestExecutorSetMetadata(t *testing.T) {
 }
 
 func TestPlanExecutorSetUDV(t *testing.T) {
-	executor, _, _, _ := createLegacyExecutorEnv()
+	executor, _, _, _ := createExecutorEnv()
 
 	testcases := []struct {
 		in  string
@@ -432,13 +433,13 @@ func TestPlanExecutorSetUDV(t *testing.T) {
 		err string
 	}{{
 		in:  "set @FOO = 'bar'",
-		out: &vtgatepb.Session{UserDefinedVariables: createMap([]string{"foo"}, []interface{}{"bar"}), Autocommit: true},
+		out: &vtgatepb.Session{UserDefinedVariables: createMap([]string{"foo"}, []any{"bar"}), Autocommit: true},
 	}, {
 		in:  "set @foo = 2",
-		out: &vtgatepb.Session{UserDefinedVariables: createMap([]string{"foo"}, []interface{}{2}), Autocommit: true},
+		out: &vtgatepb.Session{UserDefinedVariables: createMap([]string{"foo"}, []any{2}), Autocommit: true},
 	}, {
 		in:  "set @foo = 2.1, @bar = 'baz'",
-		out: &vtgatepb.Session{UserDefinedVariables: createMap([]string{"foo", "bar"}, []interface{}{2.1, "baz"}), Autocommit: true},
+		out: &vtgatepb.Session{UserDefinedVariables: createMap([]string{"foo", "bar"}, []any{sqltypes.DecimalFloat(2.1), "baz"}), Autocommit: true},
 	}}
 	for _, tcase := range testcases {
 		t.Run(tcase.in, func(t *testing.T) {
@@ -454,9 +455,9 @@ func TestPlanExecutorSetUDV(t *testing.T) {
 }
 
 func TestSetUDVFromTabletInput(t *testing.T) {
-	executor, sbc1, _, _ := createLegacyExecutorEnv()
+	executor, sbc1, _, _ := createExecutorEnv()
 
-	fields := sqltypes.MakeTestFields("some", "VARBINARY")
+	fields := sqltypes.MakeTestFields("some", "VARCHAR")
 	sbc1.SetResults([]*sqltypes.Result{
 		sqltypes.MakeTestResult(
 			fields,
@@ -464,18 +465,18 @@ func TestSetUDVFromTabletInput(t *testing.T) {
 		),
 	})
 
-	masterSession.TargetString = "TestExecutor"
+	primarySession.TargetString = "TestExecutor"
 	defer func() {
-		masterSession.TargetString = ""
+		primarySession.TargetString = ""
 	}()
 	_, err := executorExec(executor, "set @foo = concat('a','b','c')", nil)
 	require.NoError(t, err)
 
 	want := map[string]*querypb.BindVariable{"foo": sqltypes.StringBindVariable("abc")}
-	utils.MustMatch(t, want, masterSession.UserDefinedVariables, "")
+	utils.MustMatch(t, want, primarySession.UserDefinedVariables, "")
 }
 
-func createMap(keys []string, values []interface{}) map[string]*querypb.BindVariable {
+func createMap(keys []string, values []any) map[string]*querypb.BindVariable {
 	result := make(map[string]*querypb.BindVariable)
 	for i, key := range keys {
 		variable, err := sqltypes.BuildBindVariable(values[i])
@@ -485,4 +486,77 @@ func createMap(keys []string, values []interface{}) map[string]*querypb.BindVari
 		result[key] = variable
 	}
 	return result
+}
+
+func TestSetVar(t *testing.T) {
+	executor, _, _, sbc := createExecutorEnv()
+	executor.normalize = true
+
+	oldVersion := sqlparser.MySQLVersion
+	sqlparser.MySQLVersion = "80000"
+	defer func() {
+		sqlparser.MySQLVersion = oldVersion
+	}()
+	session := NewAutocommitSession(&vtgatepb.Session{EnableSystemSettings: true, TargetString: KsTestUnsharded})
+
+	sbc.SetResults([]*sqltypes.Result{sqltypes.MakeTestResult(
+		sqltypes.MakeTestFields("orig|new", "varchar|varchar"),
+		"|only_full_group_by")})
+
+	_, err := executor.Execute(context.Background(), "TestSetVar", session, "set @@sql_mode = only_full_group_by", map[string]*querypb.BindVariable{})
+	require.NoError(t, err)
+
+	tcases := []struct {
+		sql string
+		rc  bool
+	}{
+		{sql: "select 1 from user"},
+		{sql: "update user set col = 2"},
+		{sql: "delete from user"},
+		{sql: "insert into user (id) values (1)"},
+		{sql: "replace into user(id, col) values (1, 'new')"},
+		{sql: "set autocommit = 0"},
+		{sql: "show create table user"}, // reserved connection should not be set.
+		{sql: "create table foo(bar bigint)", rc: true},
+	}
+
+	for _, tc := range tcases {
+		t.Run(tc.sql, func(t *testing.T) {
+			// reset reserved conn need.
+			session.SetReservedConn(false)
+
+			_, err = executor.Execute(context.Background(), "TestSetVar", session, tc.sql, map[string]*querypb.BindVariable{})
+			require.NoError(t, err)
+			assert.Equal(t, tc.rc, session.InReservedConn())
+		})
+	}
+}
+
+func TestSetVarShowVariables(t *testing.T) {
+	executor, _, _, sbc := createExecutorEnv()
+	executor.normalize = true
+
+	oldVersion := sqlparser.MySQLVersion
+	sqlparser.MySQLVersion = "80000"
+	defer func() {
+		sqlparser.MySQLVersion = oldVersion
+	}()
+	session := NewAutocommitSession(&vtgatepb.Session{EnableSystemSettings: true, TargetString: KsTestUnsharded})
+
+	sbc.SetResults([]*sqltypes.Result{
+		// select query result for checking any change in system settings
+		sqltypes.MakeTestResult(sqltypes.MakeTestFields("orig|new", "varchar|varchar"),
+			"|only_full_group_by"),
+		// show query result
+		sqltypes.MakeTestResult(sqltypes.MakeTestFields("Variable_name|Value", "varchar|varchar"),
+			"sql_mode|ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE")})
+
+	_, err := executor.Execute(context.Background(), "TestSetVar", session, "set @@sql_mode = only_full_group_by", map[string]*querypb.BindVariable{})
+	require.NoError(t, err)
+
+	// this should return the updated value of sql_mode.
+	qr, err := executor.Execute(context.Background(), "TestSetVar", session, "show variables like 'sql_mode'", map[string]*querypb.BindVariable{})
+	require.NoError(t, err)
+	assert.False(t, session.InReservedConn(), "reserved connection should not be used")
+	assert.Equal(t, `[[VARCHAR("sql_mode") VARCHAR("only_full_group_by")]]`, fmt.Sprintf("%v", qr.Rows))
 }

@@ -30,13 +30,20 @@ interface Props<T> {
     data: T[];
     pageSize?: number;
     renderRows: (rows: T[]) => JSX.Element[];
+    title?: string;
 }
 
 // Generally, page sizes of ~100 rows are fine in terms of performance,
 // but anything over ~50 feels unwieldy in terms of UX.
 const DEFAULT_PAGE_SIZE = 50;
 
-export const DataTable = <T extends object>({ columns, data, pageSize = DEFAULT_PAGE_SIZE, renderRows }: Props<T>) => {
+export const DataTable = <T extends object>({
+    columns,
+    data,
+    pageSize = DEFAULT_PAGE_SIZE,
+    renderRows,
+    title,
+}: Props<T>) => {
     const { pathname } = useLocation();
     const urlQuery = useURLQuery();
 
@@ -58,6 +65,7 @@ export const DataTable = <T extends object>({ columns, data, pageSize = DEFAULT_
     return (
         <div>
             <table>
+                {title && <caption>{title}</caption>}
                 <thead>
                     <tr>
                         {columns.map((col, cdx) => (
@@ -70,7 +78,7 @@ export const DataTable = <T extends object>({ columns, data, pageSize = DEFAULT_
 
             <PaginationNav currentPage={page} formatLink={formatPageLink} totalPages={totalPages} />
             {!!data.length && (
-                <p className="text-color-secondary">
+                <p className="text-secondary">
                     Showing {startRow} {lastRow > startRow ? `- ${lastRow}` : null} of {data.length}
                 </p>
             )}

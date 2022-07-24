@@ -19,12 +19,17 @@ package planbuilder
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
+
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
-	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -41,18 +46,44 @@ const (
 	charset = "charset"
 )
 
-func buildShowPlan(stmt *sqlparser.Show, vschema ContextVSchema) (engine.Primitive, error) {
+func buildShowPlan(sql string, stmt *sqlparser.Show, _ *sqlparser.ReservedVars, vschema plancontext.VSchema) (*planResult, error) {
+	if vschema.Destination() != nil {
+		return buildByPassDDLPlan(sql, vschema)
+	}
+
+	var prim engine.Primitive
+	var err error
 	switch show := stmt.Internal.(type) {
 	case *sqlparser.ShowBasic:
-		return buildShowBasicPlan(show, vschema)
+		prim, err = buildShowBasicPlan(show, vschema)
 	case *sqlparser.ShowCreate:
-		return buildShowCreatePlan(show, vschema)
+		prim, err = buildShowCreatePlan(show, vschema)
+	case *sqlparser.ShowOther:
+		prim, err = buildShowOtherPlan(sql, vschema)
 	default:
-		return nil, ErrPlanNotSupported
+		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG]: undefined show type: %T", stmt.Internal)
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	return newPlanResult(prim), nil
 }
 
-func buildShowBasicPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+func buildShowOtherPlan(sql string, vschema plancontext.VSchema) (engine.Primitive, error) {
+	ks, err := vschema.AnyKeyspace()
+	if err != nil {
+		return nil, err
+	}
+	return &engine.Send{
+		Keyspace:          ks,
+		TargetDestination: key.DestinationAnyShard{},
+		Query:             sql,
+		SingleShardOnly:   true,
+	}, nil
+}
+
+func buildShowBasicPlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
 	switch show.Command {
 	case sqlparser.Charset:
 		return buildCharsetPlan(show)
@@ -67,16 +98,39 @@ func buildShowBasicPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engi
 	case sqlparser.OpenTable, sqlparser.TableStatus, sqlparser.Table, sqlparser.Trigger:
 		return buildPlanWithDB(show, vschema)
 	case sqlparser.StatusGlobal, sqlparser.StatusSession:
-		return engine.NewRowsPrimitive(make([][]sqltypes.Value, 0, 2), buildVarCharFields("Variable_name", "Value")), nil
+		return buildSendAnywherePlan(show, vschema)
 	case sqlparser.VitessMigrations:
 		return buildShowVMigrationsPlan(show, vschema)
 	case sqlparser.VGtidExecGlobal:
 		return buildShowVGtidPlan(show, vschema)
 	case sqlparser.GtidExecGlobal:
 		return buildShowGtidPlan(show, vschema)
+	case sqlparser.Warnings:
+		return buildWarnings()
+	case sqlparser.Plugins:
+		return buildPluginsPlan()
+	case sqlparser.Engines:
+		return buildEnginesPlan()
+	case sqlparser.VitessReplicationStatus, sqlparser.VitessShards, sqlparser.VitessTablets, sqlparser.VitessVariables:
+		return &engine.ShowExec{
+			Command:    show.Command,
+			ShowFilter: show.Filter,
+		}, nil
+	case sqlparser.VitessTarget:
+		return buildShowTargetPlan(vschema)
+	case sqlparser.VschemaTables:
+		return buildVschemaTablesPlan(show, vschema)
+	case sqlparser.VschemaVindexes:
+		return buildVschemaVindexesPlan(show, vschema)
 	}
 	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unknown show query type %s", show.Command.ToString())
 
+}
+
+func buildShowTargetPlan(vschema plancontext.VSchema) (engine.Primitive, error) {
+	rows := [][]sqltypes.Value{buildVarCharRow(vschema.TargetString())}
+	return engine.NewRowsPrimitive(rows,
+		buildVarCharFields("Target")), nil
 }
 
 func buildCharsetPlan(show *sqlparser.ShowBasic) (engine.Primitive, error) {
@@ -93,7 +147,7 @@ func buildCharsetPlan(show *sqlparser.ShowBasic) (engine.Primitive, error) {
 	return engine.NewRowsPrimitive(rows, fields), nil
 }
 
-func buildSendAnywherePlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+func buildSendAnywherePlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
 	ks, err := vschema.AnyKeyspace()
 	if err != nil {
 		return nil, err
@@ -107,7 +161,7 @@ func buildSendAnywherePlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (e
 	}, nil
 }
 
-func buildVariablePlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+func buildVariablePlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
 	plan, err := buildSendAnywherePlan(show, vschema)
 	if err != nil {
 		return nil, err
@@ -116,11 +170,11 @@ func buildVariablePlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engin
 	return plan, nil
 }
 
-func buildShowTblPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+func buildShowTblPlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
 	if !show.DbName.IsEmpty() {
-		show.Tbl.Qualifier = sqlparser.NewTableIdent(show.DbName.String())
+		show.Tbl.Qualifier = sqlparser.NewIdentifierCS(show.DbName.String())
 		// Remove Database Name from the query.
-		show.DbName = sqlparser.NewTableIdent("")
+		show.DbName = sqlparser.NewIdentifierCS("")
 	}
 
 	dest := key.Destination(key.DestinationAnyShard{})
@@ -141,7 +195,7 @@ func buildShowTblPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine
 			return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.UnknownTable, "Table '%s' doesn't exist", show.Tbl.Name.String())
 		}
 		// Update the table.
-		show.Tbl.Qualifier = sqlparser.NewTableIdent("")
+		show.Tbl.Qualifier = sqlparser.NewIdentifierCS("")
 		show.Tbl.Name = table.Name
 
 		if destination != nil {
@@ -159,7 +213,7 @@ func buildShowTblPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine
 	}, nil
 }
 
-func buildDBPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+func buildDBPlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
 	ks, err := vschema.AllKeyspace()
 	if err != nil {
 		return nil, err
@@ -180,10 +234,10 @@ func buildDBPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Prim
 
 	if show.Command == sqlparser.Database {
 		//Hard code default databases
-		rows = append(rows, buildVarCharRow("information_schema"))
-		rows = append(rows, buildVarCharRow("mysql"))
-		rows = append(rows, buildVarCharRow("sys"))
-		rows = append(rows, buildVarCharRow("performance_schema"))
+		ks = append(ks, &vindexes.Keyspace{Name: "information_schema"},
+			&vindexes.Keyspace{Name: "mysql"},
+			&vindexes.Keyspace{Name: "sys"},
+			&vindexes.Keyspace{Name: "performance_schema"})
 	}
 
 	for _, v := range ks {
@@ -194,8 +248,8 @@ func buildDBPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Prim
 	return engine.NewRowsPrimitive(rows, buildVarCharFields("Database")), nil
 }
 
-// buildShowVMigrationsPlan serves `SHOW VITESS_MIGRATIONS ...` queries. It invokes queries on _vt.schema_migrations on all MASTER tablets on keyspace's shards.
-func buildShowVMigrationsPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+// buildShowVMigrationsPlan serves `SHOW VITESS_MIGRATIONS ...` queries. It invokes queries on _vt.schema_migrations on all PRIMARY tablets on keyspace's shards.
+func buildShowVMigrationsPlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
 	dest, ks, tabletType, err := vschema.TargetDestination(show.DbName.String())
 	if err != nil {
 		return nil, err
@@ -204,7 +258,7 @@ func buildShowVMigrationsPlan(show *sqlparser.ShowBasic, vschema ContextVSchema)
 		return nil, vterrors.NewErrorf(vtrpcpb.Code_FAILED_PRECONDITION, vterrors.NoDB, "No database selected: use keyspace<:shard><@type> or keyspace<[range]><@type> (<> are optional)")
 	}
 
-	if tabletType != topodatapb.TabletType_MASTER {
+	if tabletType != topodatapb.TabletType_PRIMARY {
 		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "show vitess_migrations works only on primary tablet")
 	}
 
@@ -229,7 +283,7 @@ func buildShowVMigrationsPlan(show *sqlparser.ShowBasic, vschema ContextVSchema)
 	}, nil
 }
 
-func buildPlanWithDB(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+func buildPlanWithDB(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
 	dbName := show.DbName
 	dbDestination := show.DbName.String()
 	if sqlparser.SystemSchema(dbDestination) {
@@ -240,7 +294,7 @@ func buildPlanWithDB(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.
 		dbDestination = ks.Name
 	} else {
 		// Remove Database Name from the query.
-		show.DbName = sqlparser.NewTableIdent("")
+		show.DbName = sqlparser.NewIdentifierCS("")
 	}
 	destination, keyspace, _, err := vschema.TargetDestination(dbDestination)
 	if err != nil {
@@ -251,7 +305,7 @@ func buildPlanWithDB(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.
 	}
 
 	if dbName.IsEmpty() {
-		dbName = sqlparser.NewTableIdent(keyspace.Name)
+		dbName = sqlparser.NewIdentifierCS(keyspace.Name)
 	}
 
 	query := sqlparser.String(show)
@@ -279,7 +333,7 @@ func buildVarCharFields(names ...string) []*querypb.Field {
 		fields[i] = &querypb.Field{
 			Name:    v,
 			Type:    sqltypes.VarChar,
-			Charset: mysql.CharacterSetUtf8,
+			Charset: collations.CollationUtf8ID,
 			Flags:   uint32(querypb.MySqlFlag_NOT_NULL_FLAG),
 		}
 	}
@@ -311,21 +365,21 @@ func generateCharsetRows(showFilter *sqlparser.ShowFilter, colNames []string) ([
 	} else {
 		cmpExp, ok := showFilter.Filter.(*sqlparser.ComparisonExpr)
 		if !ok {
-			return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, "expect a 'LIKE' or '=' expression")
+			return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "expect a 'LIKE' or '=' expression")
 		}
 
 		left, ok := cmpExp.Left.(*sqlparser.ColName)
 		if !ok {
-			return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, "expect left side to be 'charset'")
+			return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "expect left side to be 'charset'")
 		}
 		leftOk := left.Name.EqualString(charset)
 
 		if leftOk {
 			literal, ok := cmpExp.Right.(*sqlparser.Literal)
 			if !ok {
-				return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, "we expect the right side to be a string")
+				return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "we expect the right side to be a string")
 			}
-			rightString := string(literal.Val)
+			rightString := literal.Val
 
 			switch cmpExp.Operator {
 			case sqlparser.EqualOp:
@@ -386,7 +440,7 @@ func checkLikeOpt(likeOpt string, colNames []string) (string, error) {
 	return "", nil
 }
 
-func buildShowCreatePlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (engine.Primitive, error) {
+func buildShowCreatePlan(show *sqlparser.ShowCreate, vschema plancontext.VSchema) (engine.Primitive, error) {
 	switch show.Command {
 	case sqlparser.CreateDb:
 		return buildCreateDbPlan(show, vschema)
@@ -398,7 +452,7 @@ func buildShowCreatePlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (en
 	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unknown show query type %s", show.Command.ToString())
 }
 
-func buildCreateDbPlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (engine.Primitive, error) {
+func buildCreateDbPlan(show *sqlparser.ShowCreate, vschema plancontext.VSchema) (engine.Primitive, error) {
 	dbName := show.Op.Name.String()
 	if sqlparser.SystemSchema(dbName) {
 		ks, err := vschema.AnyKeyspace()
@@ -426,7 +480,7 @@ func buildCreateDbPlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (engi
 	}, nil
 }
 
-func buildCreateTblPlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (engine.Primitive, error) {
+func buildCreateTblPlan(show *sqlparser.ShowCreate, vschema plancontext.VSchema) (engine.Primitive, error) {
 	dest := key.Destination(key.DestinationAnyShard{})
 	var ks *vindexes.Keyspace
 	var err error
@@ -448,7 +502,7 @@ func buildCreateTblPlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (eng
 		if destKs != nil {
 			dest = destKs
 		}
-		show.Op.Qualifier = sqlparser.NewTableIdent("")
+		show.Op.Qualifier = sqlparser.NewIdentifierCS("")
 		show.Op.Name = tbl.Name
 	}
 
@@ -462,7 +516,7 @@ func buildCreateTblPlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (eng
 
 }
 
-func buildCreatePlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (engine.Primitive, error) {
+func buildCreatePlan(show *sqlparser.ShowCreate, vschema plancontext.VSchema) (engine.Primitive, error) {
 	dbName := ""
 	if !show.Op.Qualifier.IsEmpty() {
 		dbName = show.Op.Qualifier.String()
@@ -475,7 +529,7 @@ func buildCreatePlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (engine
 		}
 		dbName = ks.Name
 	} else {
-		show.Op.Qualifier = sqlparser.NewTableIdent("")
+		show.Op.Qualifier = sqlparser.NewIdentifierCS("")
 	}
 
 	dest, ks, _, err := vschema.TargetDestination(dbName)
@@ -496,14 +550,14 @@ func buildCreatePlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (engine
 
 }
 
-func buildShowVGtidPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+func buildShowVGtidPlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
 	send, err := buildShowGtidPlan(show, vschema)
 	if err != nil {
 		return nil, err
 	}
 	return &engine.OrderedAggregate{
 		PreProcess: true,
-		Aggregates: []engine.AggregateParams{
+		Aggregates: []*engine.AggregateParams{
 			{
 				Opcode: engine.AggregateGtid,
 				Col:    1,
@@ -515,7 +569,7 @@ func buildShowVGtidPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engi
 	}, nil
 }
 
-func buildShowGtidPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+func buildShowGtidPlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
 	dbName := ""
 	if !show.DbName.IsEmpty() {
 		dbName = show.DbName.String()
@@ -534,4 +588,162 @@ func buildShowGtidPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engin
 		Query:             fmt.Sprintf(`select '%s' as db_name, @@global.gtid_executed as gtid_executed, :%s as shard`, ks.Name, engine.ShardName),
 		ShardNameNeeded:   true,
 	}, nil
+}
+
+func buildWarnings() (engine.Primitive, error) {
+
+	f := func(sa engine.SessionActions) (*sqltypes.Result, error) {
+		fields := []*querypb.Field{
+			{Name: "Level", Type: sqltypes.VarChar},
+			{Name: "Code", Type: sqltypes.Uint16},
+			{Name: "Message", Type: sqltypes.VarChar},
+		}
+
+		warns := sa.GetWarnings()
+		rows := make([][]sqltypes.Value, 0, len(warns))
+
+		for _, warn := range warns {
+			rows = append(rows, []sqltypes.Value{
+				sqltypes.NewVarChar("Warning"),
+				sqltypes.NewUint32(warn.Code),
+				sqltypes.NewVarChar(warn.Message),
+			})
+		}
+		return &sqltypes.Result{
+			Fields: fields,
+			Rows:   rows,
+		}, nil
+	}
+
+	return engine.NewSessionPrimitive("SHOW WARNINGS", f), nil
+}
+
+func buildPluginsPlan() (engine.Primitive, error) {
+	var rows [][]sqltypes.Value
+	rows = append(rows, buildVarCharRow(
+		"InnoDB",
+		"ACTIVE",
+		"STORAGE ENGINE",
+		"NULL",
+		"GPL"))
+
+	return engine.NewRowsPrimitive(rows,
+		buildVarCharFields("Name", "Status", "Type", "Library", "License")), nil
+}
+
+func buildEnginesPlan() (engine.Primitive, error) {
+	var rows [][]sqltypes.Value
+	rows = append(rows, buildVarCharRow(
+		"InnoDB",
+		"DEFAULT",
+		"Supports transactions, row-level locking, and foreign keys",
+		"YES",
+		"YES",
+		"YES"))
+
+	return engine.NewRowsPrimitive(rows,
+		buildVarCharFields("Engine", "Support", "Comment", "Transactions", "XA", "Savepoints")), nil
+}
+
+func buildVschemaTablesPlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
+	vs := vschema.GetVSchema()
+	ks, err := vschema.DefaultKeyspace()
+	if err != nil {
+		return nil, err
+	}
+	schemaKs, ok := vs.Keyspaces[ks.Name]
+	if !ok {
+		return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadDb, "Unknown database '%s' in vschema", ks.Name)
+	}
+
+	var tables []string
+	for name := range schemaKs.Tables {
+		tables = append(tables, name)
+	}
+	sort.Strings(tables)
+
+	rows := make([][]sqltypes.Value, len(tables))
+	for i, v := range tables {
+		rows[i] = buildVarCharRow(v)
+	}
+
+	return engine.NewRowsPrimitive(rows, buildVarCharFields("Tables")), nil
+}
+
+func buildVschemaVindexesPlan(show *sqlparser.ShowBasic, vschema plancontext.VSchema) (engine.Primitive, error) {
+	vs := vschema.GetSrvVschema()
+	rows := make([][]sqltypes.Value, 0, 16)
+
+	if !show.Tbl.IsEmpty() {
+		_, ks, _, err := vschema.TargetDestination(show.Tbl.Qualifier.String())
+		if err != nil {
+			return nil, err
+		}
+		var schemaKs *vschemapb.Keyspace
+		var tbl *vschemapb.Table
+		if !ks.Sharded {
+			tbl = &vschemapb.Table{}
+		} else {
+			schemaKs = vs.Keyspaces[ks.Name]
+			tableName := show.Tbl.Name.String()
+			schemaTbl, ok := schemaKs.Tables[tableName]
+			if !ok {
+				return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.NoSuchTable, "table '%s' does not exist in keyspace '%s'", tableName, ks.Name)
+			}
+			tbl = schemaTbl
+		}
+
+		for _, colVindex := range tbl.ColumnVindexes {
+			vindex, ok := schemaKs.Vindexes[colVindex.GetName()]
+			columns := colVindex.GetColumns()
+			if len(columns) == 0 {
+				columns = []string{colVindex.GetColumn()}
+			}
+			if ok {
+				params := make([]string, 0, 4)
+				for k, v := range vindex.GetParams() {
+					params = append(params, fmt.Sprintf("%s=%s", k, v))
+				}
+				sort.Strings(params)
+				rows = append(rows, buildVarCharRow(strings.Join(columns, ", "), colVindex.GetName(), vindex.GetType(), strings.Join(params, "; "), vindex.GetOwner()))
+			} else {
+				rows = append(rows, buildVarCharRow(strings.Join(columns, ", "), colVindex.GetName(), "", "", ""))
+			}
+		}
+
+		return engine.NewRowsPrimitive(rows,
+			buildVarCharFields("Columns", "Name", "Type", "Params", "Owner"),
+		), nil
+	}
+
+	// For the query interface to be stable we need to sort
+	// for each of the map iterations
+	ksNames := make([]string, 0, len(vs.Keyspaces))
+	for name := range vs.Keyspaces {
+		ksNames = append(ksNames, name)
+	}
+	sort.Strings(ksNames)
+	for _, ksName := range ksNames {
+		ks := vs.Keyspaces[ksName]
+
+		vindexNames := make([]string, 0, len(ks.Vindexes))
+		for name := range ks.Vindexes {
+			vindexNames = append(vindexNames, name)
+		}
+		sort.Strings(vindexNames)
+		for _, vindexName := range vindexNames {
+			vindex := ks.Vindexes[vindexName]
+
+			params := make([]string, 0, 4)
+			for k, v := range vindex.GetParams() {
+				params = append(params, fmt.Sprintf("%s=%s", k, v))
+			}
+			sort.Strings(params)
+			rows = append(rows, buildVarCharRow(ksName, vindexName, vindex.GetType(), strings.Join(params, "; "), vindex.GetOwner()))
+		}
+	}
+	return engine.NewRowsPrimitive(rows,
+		buildVarCharFields("Keyspace", "Name", "Type", "Params", "Owner"),
+	), nil
+
 }

@@ -17,7 +17,6 @@ limitations under the License.
 package vreplication
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -29,7 +28,9 @@ import (
 
 	"vitess.io/vitess/go/vt/vterrors"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/prototext"
+
+	"vitess.io/vitess/go/bytes2"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
@@ -42,13 +43,15 @@ import (
 )
 
 type vcopier struct {
-	vr        *vreplicator
-	tablePlan *TablePlan
+	vr               *vreplicator
+	tablePlan        *TablePlan
+	throttlerAppName string
 }
 
 func newVCopier(vr *vreplicator) *vcopier {
 	return &vcopier{
-		vr: vr,
+		vr:               vr,
+		throttlerAppName: vr.throttlerAppName(),
 	}
 }
 
@@ -59,7 +62,7 @@ func newVCopier(vr *vreplicator) *vcopier {
 func (vc *vcopier) initTablesForCopy(ctx context.Context) error {
 	defer vc.vr.dbClient.Rollback()
 
-	plan, err := buildReplicatorPlan(vc.vr.source.Filter, vc.vr.pkInfoMap, nil, vc.vr.stats)
+	plan, err := buildReplicatorPlan(vc.vr.source, vc.vr.colInfoMap, nil, vc.vr.stats)
 	if err != nil {
 		return err
 	}
@@ -79,6 +82,10 @@ func (vc *vcopier) initTablesForCopy(ctx context.Context) error {
 			return err
 		}
 		if err := vc.vr.setState(binlogplayer.VReplicationCopying, ""); err != nil {
+			return err
+		}
+		if err := vc.vr.insertLog(LogCopyStart, fmt.Sprintf("Copy phase started for %d table(s)",
+			len(plan.TargetTables))); err != nil {
 			return err
 		}
 	} else {
@@ -122,7 +129,7 @@ func (vc *vcopier) copyNext(ctx context.Context, settings binlogplayer.VRSetting
 		copyState[tableName] = nil
 		if lastpk != "" {
 			var r querypb.QueryResult
-			if err := proto.UnmarshalText(lastpk, &r); err != nil {
+			if err := prototext.Unmarshal([]byte(lastpk), &r); err != nil {
 				return err
 			}
 			copyState[tableName] = sqltypes.Proto3ToResult(&r)
@@ -138,14 +145,12 @@ func (vc *vcopier) copyNext(ctx context.Context, settings binlogplayer.VRSetting
 }
 
 // catchup replays events to the subset of the tables that have been copied
-// until replication is caught up. In order to stop, the seconds behind master has
+// until replication is caught up. In order to stop, the seconds behind primary has
 // to fall below replicationLagTolerance.
 func (vc *vcopier) catchup(ctx context.Context, copyState map[string]*sqltypes.Result) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	defer func() {
-		vc.vr.stats.PhaseTimings.Record("catchup", time.Now())
-	}()
+	defer vc.vr.stats.PhaseTimings.Record("catchup", time.Now())
 
 	settings, err := binlogplayer.ReadVRSettings(vc.vr.dbClient, vc.vr.id)
 	if err != nil {
@@ -166,9 +171,9 @@ func (vc *vcopier) catchup(ctx context.Context, copyState map[string]*sqltypes.R
 	// Wait for catchup.
 	tkr := time.NewTicker(waitRetryTime)
 	defer tkr.Stop()
-	seconds := int64(replicaLagTolerance / time.Second)
+	seconds := int64(*replicaLagTolerance / time.Second)
 	for {
-		sbm := vc.vr.stats.SecondsBehindMaster.Get()
+		sbm := vc.vr.stats.ReplicationLagSeconds.Get()
 		if sbm < seconds {
 			cancel()
 			// Make sure vplayer returns before returning.
@@ -203,10 +208,12 @@ func (vc *vcopier) getClientConnection() (*vdbClient, error) {
 	return dbClient, nil
 }
 
-func (vc *vcopier) updateLastPK(dbClient *vdbClient, updateCopyState *sqlparser.ParsedQuery, pkfields []*querypb.Field, lastpk *querypb.Row) error {
-	var buf bytes.Buffer
-	err := proto.CompactText(&buf, &querypb.QueryResult{
-		Fields: pkfields,
+func (vc *vcopier) updateLastPK(dbClient *vdbClient, updateCopyState *sqlparser.ParsedQuery, pkFields []*querypb.Field, lastpk *querypb.Row) error {
+	var buf []byte
+	var err error
+
+	buf, err = prototext.Marshal(&querypb.QueryResult{
+		Fields: pkFields,
 		Rows:   []*querypb.Row{lastpk},
 	})
 	if err != nil {
@@ -215,7 +222,7 @@ func (vc *vcopier) updateLastPK(dbClient *vdbClient, updateCopyState *sqlparser.
 	bv := map[string]*querypb.BindVariable{
 		"lastpk": {
 			Type:  sqltypes.VarBinary,
-			Value: buf.Bytes(),
+			Value: buf,
 		},
 	}
 	updateCopyStateQuery, err := updateCopyState.GenerateQuery(bv, nil)
@@ -239,10 +246,11 @@ func getCopyBatchConcurrency() int {
 
 // BatchInfo has the information required to insert one batch during the copy phase
 type BatchInfo struct {
-	rows     []*querypb.Row
-	lastpk   *querypb.Row
-	dbClient *vdbClient
-	ch       chan error
+	rows      []*querypb.Row
+	lastpk    *querypb.Row
+	dbClient  *vdbClient
+	ch        chan error
+	sqlbuffer *bytes2.Buffer
 }
 
 // BatchesInfo has all the information required to insert a set of batches concurrently during the copy phase
@@ -266,7 +274,7 @@ func (vc *vcopier) copyBatch(ctx context.Context, batch *BatchInfo) {
 		batch.ch <- err
 	}()
 
-	_, err = vc.tablePlan.applyBulkInsert(batch.rows, func(sql string) (*sqltypes.Result, error) {
+	_, err = vc.tablePlan.applyBulkInsert(batch.sqlbuffer, batch.rows, func(sql string) (*sqltypes.Result, error) {
 		if err = batch.dbClient.Begin(); err != nil {
 			log.Infof("Error in Begin() %s", err)
 			return nil, err
@@ -281,7 +289,7 @@ func (vc *vcopier) copyBatch(ctx context.Context, batch *BatchInfo) {
 }
 
 func (vc *vcopier) copyBatches(ctx context.Context, batchesInfo *BatchesInfo, updateCopyState *sqlparser.ParsedQuery,
-	pkfields []*querypb.Field, dbClientPool []*vdbClient) error {
+	pkFields []*querypb.Field, dbClientPool []*vdbClient) error {
 
 	start := time.Now()
 	numBatches := len(batchesInfo.batches)
@@ -309,7 +317,7 @@ func (vc *vcopier) copyBatches(ctx context.Context, batchesInfo *BatchesInfo, up
 				vc.vr.stats.ErrorCounts.Add([]string{"BulkCopy"}, 1)
 				return err
 			}
-			if err := vc.updateLastPK(batch.dbClient, updateCopyState, pkfields, batch.lastpk); err != nil {
+			if err := vc.updateLastPK(batch.dbClient, updateCopyState, pkFields, batch.lastpk); err != nil {
 				err = fmt.Errorf("error updating lastpk to %v: %s", batch.lastpk, err)
 				log.Errorf(err.Error())
 				return err
@@ -345,13 +353,12 @@ func (vc *vcopier) copyBatches(ctx context.Context, batchesInfo *BatchesInfo, up
 // committed with the lastpk. This allows for consistent resumability.
 func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState map[string]*sqltypes.Result) error {
 	defer vc.vr.dbClient.Rollback()
-	defer func() {
-		vc.vr.stats.PhaseTimings.Record("copy", time.Now())
-		vc.vr.stats.CopyLoopCount.Add(1)
-	}()
+	defer vc.vr.stats.PhaseTimings.Record("copy", time.Now())
+	defer vc.vr.stats.CopyLoopCount.Add(1)
 
 	log.Infof("Copying table %s, lastpk: %v", tableName, copyState[tableName])
-	plan, err := buildReplicatorPlan(vc.vr.source.Filter, vc.vr.pkInfoMap, nil, vc.vr.stats)
+
+	plan, err := buildReplicatorPlan(vc.vr.source, vc.vr.colInfoMap, nil, vc.vr.stats)
 	if err != nil {
 		return err
 	}
@@ -361,18 +368,22 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 		return fmt.Errorf("plan not found for table: %s, current plans are: %#v", tableName, plan.TargetTables)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, copyTimeout)
+	ctx, cancel := context.WithTimeout(ctx, *copyPhaseDuration)
 	defer cancel()
 
 	var currentLastPKpb *querypb.QueryResult
 	if lastpkqr := copyState[tableName]; lastpkqr != nil {
 		currentLastPKpb = sqltypes.ResultToProto3(lastpkqr)
 	}
-	var updateCopyState *sqlparser.ParsedQuery
-	var pkFields []*querypb.Field
+
+	rowsCopiedTicker := time.NewTicker(rowsCopiedUpdateInterval)
+	defer rowsCopiedTicker.Stop()
+
 	var batches []*BatchInfo
 	var insert bool
 	var lastpk *querypb.Row
+	var pkFields []*querypb.Field
+	var updateCopyState *sqlparser.ParsedQuery
 
 	concurrentBatches := getCopyBatchConcurrency()
 	dbClientPool := make([]*vdbClient, concurrentBatches)
@@ -397,13 +408,26 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 	err = vc.vr.sourceVStreamer.VStreamRows(ctx, initialPlan.SendRule.Filter, currentLastPKpb, func(rows *binlogdatapb.VStreamRowsResponse) error {
 		for {
 			select {
+			case <-rowsCopiedTicker.C:
+				update := binlogplayer.GenerateUpdateRowsCopied(vc.vr.id, vc.vr.stats.CopyRowCount.Get())
+				_, _ = vc.vr.dbClient.Execute(update)
 			case <-ctx.Done():
 				return io.EOF
 			default:
 			}
+			if rows.Throttled {
+				_ = vc.vr.updateTimeThrottled(RowStreamerComponentName)
+				return nil
+			}
+			if rows.Heartbeat {
+				_ = vc.vr.updateHeartbeatTime(time.Now().Unix())
+				return nil
+			}
 			// verify throttler is happy, otherwise keep looping
-			if vc.vr.vre.throttlerClient.ThrottleCheckOKOrWait(ctx) {
-				break
+			if vc.vr.vre.throttlerClient.ThrottleCheckOKOrWaitAppName(ctx, vc.throttlerAppName) {
+				break // out of 'for' loop
+			} else { // we're throttled
+				_ = vc.vr.updateTimeThrottled(VCopierComponentName)
 			}
 		}
 		if vc.tablePlan == nil {
@@ -415,13 +439,13 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 			}
 			fieldEvent := &binlogdatapb.FieldEvent{
 				TableName: initialPlan.SendRule.Match,
-				Fields:    rows.Fields,
 			}
+			fieldEvent.Fields = append(fieldEvent.Fields, rows.Fields...)
 			vc.tablePlan, err = plan.buildExecutionPlan(fieldEvent)
 			if err != nil {
 				return err
 			}
-			pkFields = rows.Pkfields
+			pkFields = append(pkFields, rows.Pkfields...)
 			buf := sqlparser.NewTrackedBuffer(nil)
 			buf.Myprintf("update _vt.copy_state set lastpk=%a where vrepl_id=%s and table_name=%s", ":lastpk",
 				strconv.Itoa(int(vc.vr.id)), encodeString(tableName))
@@ -434,9 +458,10 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 			insert = true
 		} else {
 			batch := &BatchInfo{
-				rows:   rows.Rows,
-				lastpk: rows.Lastpk,
-				ch:     make(chan error, 1),
+				rows:      rows.Rows,
+				lastpk:    rows.Lastpk,
+				ch:        make(chan error, 1),
+				sqlbuffer: &bytes2.Buffer{},
 			}
 			batches = append(batches, batch)
 			if len(batches) >= concurrentBatches {
@@ -457,7 +482,6 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 		// to data size, this should map to a uniform amount of pages affected
 		// per statement. A packet size of 30K will roughly translate to 8
 		// mysql pages of 4K each.
-
 		return nil
 	})
 
@@ -491,9 +515,7 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 }
 
 func (vc *vcopier) fastForward(ctx context.Context, copyState map[string]*sqltypes.Result, gtid string) error {
-	defer func() {
-		vc.vr.stats.PhaseTimings.Record("fastforward", time.Now())
-	}()
+	defer vc.vr.stats.PhaseTimings.Record("fastforward", time.Now())
 	pos, err := mysql.DecodePosition(gtid)
 	if err != nil {
 		return err
@@ -503,7 +525,7 @@ func (vc *vcopier) fastForward(ctx context.Context, copyState map[string]*sqltyp
 		return err
 	}
 	if settings.StartPos.IsZero() {
-		update := binlogplayer.GenerateUpdatePos(vc.vr.id, pos, time.Now().Unix(), 0)
+		update := binlogplayer.GenerateUpdatePos(vc.vr.id, pos, time.Now().Unix(), 0, vc.vr.stats.CopyRowCount.Get(), *vreplicationStoreCompressedGTID)
 		_, err := vc.vr.dbClient.Execute(update)
 		return err
 	}

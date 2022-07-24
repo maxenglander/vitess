@@ -17,19 +17,27 @@ limitations under the License.
 
 package topodata
 
+import hack "vitess.io/vitess/go/hack"
+
 func (cached *KeyRange) CachedSize(alloc bool) int64 {
 	if cached == nil {
 		return int64(0)
 	}
 	size := int64(0)
 	if alloc {
-		size += int64(76)
+		size += int64(96)
+	}
+	// field unknownFields []byte
+	{
+		size += hack.RuntimeAllocSize(int64(cap(cached.unknownFields)))
 	}
 	// field Start []byte
-	size += int64(cap(cached.Start))
+	{
+		size += hack.RuntimeAllocSize(int64(cap(cached.Start)))
+	}
 	// field End []byte
-	size += int64(cap(cached.End))
-	// field XXX_unrecognized []byte
-	size += int64(cap(cached.XXX_unrecognized))
+	{
+		size += hack.RuntimeAllocSize(int64(cap(cached.End)))
+	}
 	return size
 }

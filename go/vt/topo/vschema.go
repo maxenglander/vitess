@@ -19,12 +19,12 @@ package topo
 import (
 	"path"
 
+	"google.golang.org/protobuf/proto"
+
 	"context"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/vterrors"
-
-	"github.com/golang/protobuf/proto"
 
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
@@ -46,7 +46,9 @@ func (ts *Server) SaveVSchema(ctx context.Context, keyspace string, vschema *vsc
 
 	_, err = ts.globalCell.Update(ctx, nodePath, data, nil)
 	if err != nil {
-		log.Infof("successfully updated vschema for keyspace %s: %v", keyspace, data)
+		log.Errorf("failed to update vschema for keyspace %s: %v", keyspace, err)
+	} else {
+		log.Infof("successfully updated vschema for keyspace %s: %+v", keyspace, vschema)
 	}
 	return err
 }

@@ -17,9 +17,10 @@ limitations under the License.
 package vtgate
 
 import (
-	"reflect"
 	"strings"
 	"testing"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/stretchr/testify/assert"
 
@@ -28,8 +29,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"context"
-
-	"github.com/golang/protobuf/proto"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/discovery"
@@ -44,18 +43,16 @@ import (
 
 // This file uses the sandbox_test framework.
 
-var hcVTGateTest *discovery.FakeLegacyHealthCheck
+var hcVTGateTest *discovery.FakeHealthCheck
 
 var executeOptions = &querypb.ExecuteOptions{
 	IncludedFields: querypb.ExecuteOptions_TYPE_ONLY,
 }
 
-var masterSession = &vtgatepb.Session{
-	TargetString: "@master",
-}
+var primarySession *vtgatepb.Session
 
 func init() {
-	getSandbox(KsTestUnsharded).VSchema = `
+	createSandbox(KsTestUnsharded).VSchema = `
 {
 	"sharded": false,
 	"tables": {
@@ -63,7 +60,7 @@ func init() {
 	}
 }
 `
-	getSandbox(KsTestBadVSchema).VSchema = `
+	createSandbox(KsTestBadVSchema).VSchema = `
 {
 	"sharded": true,
 	"tables": {
@@ -76,14 +73,9 @@ func init() {
 	}
 }
 `
-	hcVTGateTest = discovery.NewFakeLegacyHealthCheck()
+	hcVTGateTest = discovery.NewFakeHealthCheck(nil)
 	*transactionMode = "MULTI"
-	// Use legacy gateway until we can rewrite these tests to use new tabletgateway
-	*GatewayImplementation = GatewayImplementationDiscovery
-	// The topo.Server is used to start watching the cells described
-	// in '-cells_to_watch' command line parameter, which is
-	// empty by default. So it's unused in this test, set to nil.
-	LegacyInit(context.Background(), hcVTGateTest, new(sandboxTopo), "aa", 10, nil)
+	Init(context.Background(), hcVTGateTest, new(sandboxTopo), "aa", nil, querypb.ExecuteOptions_Gen4)
 
 	*mysqlServerPort = 0
 	*mysqlAuthServerImpl = "none"
@@ -93,12 +85,12 @@ func init() {
 func TestVTGateExecute(t *testing.T) {
 	createSandbox(KsTestUnsharded)
 	hcVTGateTest.Reset()
-	sbc := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_MASTER, true, 1, nil)
+	sbc := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
 	_, qr, err := rpcVTGate.Execute(
 		context.Background(),
 		&vtgatepb.Session{
 			Autocommit:   true,
-			TargetString: "@master",
+			TargetString: "@primary",
 			Options:      executeOptions,
 		},
 		"select id from t1",
@@ -109,9 +101,7 @@ func TestVTGateExecute(t *testing.T) {
 	}
 	want := *sandboxconn.SingleRowResult
 	want.StatusFlags = 0 // VTGate result set does not contain status flags in sqltypes.Result
-	if !reflect.DeepEqual(&want, qr) {
-		t.Errorf("want \n%+v, got \n%+v", sandboxconn.SingleRowResult, qr)
-	}
+	utils.MustMatch(t, &want, qr)
 	if !proto.Equal(sbc.Options[0], executeOptions) {
 		t.Errorf("got ExecuteOptions \n%+v, want \n%+v", sbc.Options[0], executeOptions)
 	}
@@ -120,7 +110,7 @@ func TestVTGateExecute(t *testing.T) {
 func TestVTGateExecuteWithKeyspaceShard(t *testing.T) {
 	createSandbox(KsTestUnsharded)
 	hcVTGateTest.Reset()
-	hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_MASTER, true, 1, nil)
+	hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
 
 	// Valid keyspace.
 	_, qr, err := rpcVTGate.Execute(
@@ -136,9 +126,7 @@ func TestVTGateExecuteWithKeyspaceShard(t *testing.T) {
 	}
 	wantQr := *sandboxconn.SingleRowResult
 	wantQr.StatusFlags = 0 // VTGate result set does not contain status flags in sqltypes.Result
-	if !reflect.DeepEqual(&wantQr, qr) {
-		t.Errorf("want \n%+v, got \n%+v", sandboxconn.SingleRowResult, qr)
-	}
+	utils.MustMatch(t, &wantQr, qr)
 
 	// Invalid keyspace.
 	_, _, err = rpcVTGate.Execute(
@@ -149,14 +137,14 @@ func TestVTGateExecuteWithKeyspaceShard(t *testing.T) {
 		"select id from none",
 		nil,
 	)
-	want := "keyspace invalid_keyspace not found in vschema"
+	want := "Unknown database 'invalid_keyspace' in vschema"
 	assert.EqualError(t, err, want)
 
 	// Valid keyspace/shard.
 	_, qr, err = rpcVTGate.Execute(
 		context.Background(),
 		&vtgatepb.Session{
-			TargetString: KsTestUnsharded + ":0@master",
+			TargetString: KsTestUnsharded + ":0@primary",
 		},
 		"select id from none",
 		nil,
@@ -164,21 +152,19 @@ func TestVTGateExecuteWithKeyspaceShard(t *testing.T) {
 	if err != nil {
 		t.Errorf("want nil, got %v", err)
 	}
-	if !reflect.DeepEqual(&wantQr, qr) {
-		t.Errorf("want \n%+v, got \n%+v", sandboxconn.SingleRowResult, qr)
-	}
+	utils.MustMatch(t, &wantQr, qr)
 
 	// Invalid keyspace/shard.
 	_, _, err = rpcVTGate.Execute(
 		context.Background(),
 		&vtgatepb.Session{
-			TargetString: KsTestUnsharded + ":noshard@master",
+			TargetString: KsTestUnsharded + ":noshard@primary",
 		},
 		"select id from none",
 		nil,
 	)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), `no healthy tablet available for 'keyspace:"TestUnsharded" shard:"noshard" tablet_type:MASTER`)
+	require.Contains(t, err.Error(), `no healthy tablet available for 'keyspace:"TestUnsharded" shard:"noshard" tablet_type:PRIMARY`)
 }
 
 func TestVTGateStreamExecute(t *testing.T) {
@@ -186,12 +172,12 @@ func TestVTGateStreamExecute(t *testing.T) {
 	shard := "0"
 	createSandbox(ks)
 	hcVTGateTest.Reset()
-	sbc := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, ks, shard, topodatapb.TabletType_MASTER, true, 1, nil)
+	sbc := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, ks, shard, topodatapb.TabletType_PRIMARY, true, 1, nil)
 	var qrs []*sqltypes.Result
 	err := rpcVTGate.StreamExecute(
 		context.Background(),
 		&vtgatepb.Session{
-			TargetString: "@master",
+			TargetString: "@primary",
 			Options:      executeOptions,
 		},
 		"select id from t1",
@@ -201,9 +187,7 @@ func TestVTGateStreamExecute(t *testing.T) {
 			return nil
 		},
 	)
-	if err != nil {
-		t.Errorf("want nil, got %v", err)
-	}
+	require.NoError(t, err)
 	want := []*sqltypes.Result{{
 		Fields: sandboxconn.StreamRowResult.Fields,
 	}, {
@@ -265,7 +249,7 @@ func testErrorPropagation(t *testing.T, sbcs []*sandboxconn.SandboxConn, before 
 	}
 	_, _, err := rpcVTGate.Execute(
 		context.Background(),
-		masterSession,
+		primarySession,
 		"select id from t1",
 		nil,
 	)
@@ -287,7 +271,7 @@ func testErrorPropagation(t *testing.T, sbcs []*sandboxconn.SandboxConn, before 
 	}
 	err = rpcVTGate.StreamExecute(
 		context.Background(),
-		masterSession,
+		primarySession,
 		"select id from t1",
 		nil,
 		func(r *sqltypes.Result) error {
@@ -308,13 +292,18 @@ func testErrorPropagation(t *testing.T, sbcs []*sandboxconn.SandboxConn, before 
 }
 
 // TestErrorPropagation tests an error returned by sandboxconn is
-// properly propagated through vtgate layers.  We need both a master
+// properly propagated through vtgate layers.  We need both a primary
 // tablet and a rdonly tablet because we don't control the routing of
 // Commit.
 func TestErrorPropagation(t *testing.T) {
 	createSandbox(KsTestUnsharded)
 	hcVTGateTest.Reset()
-	sbcm := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_MASTER, true, 1, nil)
+	// create a new session each time so that ShardSessions don't get re-used across tests
+	primarySession = &vtgatepb.Session{
+		TargetString: "@primary",
+	}
+
+	sbcm := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
 	sbcrdonly := hcVTGateTest.AddTestTablet("aa", "1.1.1.2", 1001, KsTestUnsharded, "0", topodatapb.TabletType_RDONLY, true, 1, nil)
 	sbcs := []*sandboxconn.SandboxConn{
 		sbcm,
@@ -399,7 +388,7 @@ func TestErrorPropagation(t *testing.T) {
 func TestErrorIssuesRollback(t *testing.T) {
 	createSandbox(KsTestUnsharded)
 	hcVTGateTest.Reset()
-	sbc := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_MASTER, true, 1, nil)
+	sbc := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
 
 	// Start a transaction, send one statement.
 	// Simulate an error that should trigger a rollback:
@@ -519,4 +508,118 @@ func TestErrorIssuesRollback(t *testing.T) {
 		t.Errorf("want 0, got %d", sbc.RollbackCount.Get())
 	}
 	sbc.MustFailCodes[vtrpcpb.Code_ALREADY_EXISTS] = 0
+}
+
+var shardedVSchema = `
+{
+	"sharded": true,
+	"vindexes": {
+		"hash_index": {
+			"type": "hash"
+		}
+	},
+	"tables": {
+		"sp_tbl": {
+			"column_vindexes": [
+				{
+					"column": "user_id",
+					"name": "hash_index"
+				}
+			]
+		}
+	}
+}
+`
+
+func TestMultiInternalSavepointVtGate(t *testing.T) {
+	s := createSandbox(KsTestSharded)
+	s.ShardSpec = "-40-80-"
+	s.VSchema = shardedVSchema
+	srvSchema := getSandboxSrvVSchema()
+	rpcVTGate.executor.vm.VSchemaUpdate(srvSchema, nil)
+	hcVTGateTest.Reset()
+
+	sbc1 := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1, KsTestSharded, "-40", topodatapb.TabletType_PRIMARY, true, 1, nil)
+	sbc2 := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 2, KsTestSharded, "40-80", topodatapb.TabletType_PRIMARY, true, 1, nil)
+	sbc3 := hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 3, KsTestSharded, "80-", topodatapb.TabletType_PRIMARY, true, 1, nil)
+
+	logChan := QueryLogger.Subscribe("Test")
+	defer QueryLogger.Unsubscribe(logChan)
+
+	session := &vtgatepb.Session{Autocommit: true}
+	require.True(t, session.GetAutocommit())
+	require.False(t, session.InTransaction)
+
+	var err error
+	session, _, err = rpcVTGate.Execute(context.Background(), session, "begin", nil)
+	require.NoError(t, err)
+	require.True(t, session.GetAutocommit())
+	require.True(t, session.InTransaction)
+
+	// this query goes to multiple shards so internal savepoint will be created.
+	session, _, err = rpcVTGate.Execute(context.Background(), session, "insert into sp_tbl(user_id) values (1), (3)", nil)
+	require.NoError(t, err)
+	require.True(t, session.GetAutocommit())
+	require.True(t, session.InTransaction)
+
+	wantQ := []*querypb.BoundQuery{{
+		Sql:           "savepoint x",
+		BindVariables: map[string]*querypb.BindVariable{},
+	}, {
+		Sql: "insert into sp_tbl(user_id) values (:_user_id_0)",
+		BindVariables: map[string]*querypb.BindVariable{
+			"_user_id_0": sqltypes.Int64BindVariable(1),
+			"_user_id_1": sqltypes.Int64BindVariable(3),
+			"vtg1":       sqltypes.Int64BindVariable(1),
+			"vtg2":       sqltypes.Int64BindVariable(3),
+		},
+	}}
+	assertQueriesWithSavepoint(t, sbc1, wantQ)
+	wantQ[1].Sql = "insert into sp_tbl(user_id) values (:_user_id_1)"
+	assertQueriesWithSavepoint(t, sbc2, wantQ)
+	assert.Len(t, sbc3.Queries, 0)
+	// internal savepoint should be removed.
+	assert.Len(t, session.Savepoints, 0)
+	sbc1.Queries = nil
+	sbc2.Queries = nil
+
+	// multi shard so new savepoint will be created.
+	session, _, err = rpcVTGate.Execute(context.Background(), session, "insert into sp_tbl(user_id) values (2), (4)", nil)
+	require.NoError(t, err)
+	wantQ = []*querypb.BoundQuery{{
+		Sql:           "savepoint x",
+		BindVariables: map[string]*querypb.BindVariable{},
+	}, {
+		Sql: "insert into sp_tbl(user_id) values (:_user_id_1)",
+		BindVariables: map[string]*querypb.BindVariable{
+			"_user_id_0": sqltypes.Int64BindVariable(2),
+			"_user_id_1": sqltypes.Int64BindVariable(4),
+			"vtg1":       sqltypes.Int64BindVariable(2),
+			"vtg2":       sqltypes.Int64BindVariable(4),
+		},
+	}}
+	assertQueriesWithSavepoint(t, sbc3, wantQ)
+	// internal savepoint should be removed.
+	assert.Len(t, session.Savepoints, 0)
+	sbc2.Queries = nil
+	sbc3.Queries = nil
+
+	// single shard so no savepoint will be created and neither any old savepoint will be executed
+	_, _, err = rpcVTGate.Execute(context.Background(), session, "insert into sp_tbl(user_id) values (5)", nil)
+	require.NoError(t, err)
+	wantQ = []*querypb.BoundQuery{{
+		Sql: "insert into sp_tbl(user_id) values (:_user_id_0)",
+		BindVariables: map[string]*querypb.BindVariable{
+			"_user_id_0": sqltypes.Int64BindVariable(5),
+			"vtg1":       sqltypes.Int64BindVariable(5),
+		},
+	}}
+	assertQueriesWithSavepoint(t, sbc2, wantQ)
+
+	testQueryLog(t, logChan, "Execute", "BEGIN", "begin", 0)
+	testQueryLog(t, logChan, "MarkSavepoint", "SAVEPOINT", "savepoint x", 0)
+	testQueryLog(t, logChan, "Execute", "INSERT", "insert into sp_tbl(user_id) values (:vtg1), (:vtg2)", 2)
+	testQueryLog(t, logChan, "MarkSavepoint", "SAVEPOINT", "savepoint y", 2)
+	testQueryLog(t, logChan, "Execute", "INSERT", "insert into sp_tbl(user_id) values (:vtg1), (:vtg2)", 2)
+	testQueryLog(t, logChan, "Execute", "INSERT", "insert into sp_tbl(user_id) values (:vtg1)", 1)
 }

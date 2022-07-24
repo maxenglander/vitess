@@ -154,7 +154,7 @@ func NewFakeTablet(t *testing.T, wr *wrangler.Wrangler, cell string, uid uint32,
 	delete(tablet.PortMap, "start_http_server")
 	_, force := tablet.PortMap["force_init"]
 	delete(tablet.PortMap, "force_init")
-	if err := wr.InitTablet(context.Background(), tablet, force, true /* createShardAndKeyspace */, false /* allowUpdate */); err != nil {
+	if err := wr.TopoServer().InitTablet(context.Background(), tablet, force, true /* createShardAndKeyspace */, false /* allowUpdate */); err != nil {
 		t.Fatalf("cannot create tablet %v: %v", uid, err)
 	}
 
@@ -257,8 +257,8 @@ func (ft *FakeTablet) StopActionLoop(t *testing.T) {
 }
 
 // Target returns the keyspace/shard/type info of this tablet as Target.
-func (ft *FakeTablet) Target() querypb.Target {
-	return querypb.Target{
+func (ft *FakeTablet) Target() *querypb.Target {
+	return &querypb.Target{
 		Keyspace:   ft.Tablet.Keyspace,
 		Shard:      ft.Tablet.Shard,
 		TabletType: ft.Tablet.Type,

@@ -253,12 +253,15 @@ func (c *Conn) readColumnDefinitionType(field *querypb.Field, index int) error {
 
 // parseRow parses an individual row.
 // Returns a SQLError.
-func (c *Conn) parseRow(data []byte, fields []*querypb.Field, reader func([]byte, int) ([]byte, int, bool)) ([]sqltypes.Value, error) {
+func (c *Conn) parseRow(data []byte, fields []*querypb.Field, reader func([]byte, int) ([]byte, int, bool), result []sqltypes.Value) ([]sqltypes.Value, error) {
 	colNumber := len(fields)
-	result := make([]sqltypes.Value, colNumber)
+	if result == nil {
+		result = make([]sqltypes.Value, 0, colNumber)
+	}
 	pos := 0
 	for i := 0; i < colNumber; i++ {
 		if data[pos] == NullValue {
+			result = append(result, sqltypes.Value{})
 			pos++
 			continue
 		}
@@ -268,7 +271,7 @@ func (c *Conn) parseRow(data []byte, fields []*querypb.Field, reader func([]byte
 		if !ok {
 			return nil, NewSQLError(CRMalformedPacket, SSUnknownSQLState, "decoding string failed")
 		}
-		result[i] = sqltypes.MakeTrusted(fields[i].Type, s)
+		result = append(result, sqltypes.MakeTrusted(fields[i].Type, s))
 	}
 	return result, nil
 }
@@ -362,6 +365,7 @@ func (c *Conn) ReadQueryResult(maxrows int, wantfields bool) (*sqltypes.Result, 
 			InsertID:            packetOk.lastInsertID,
 			SessionStateChanges: packetOk.sessionStateData,
 			StatusFlags:         packetOk.statusFlags,
+			Info:                packetOk.info,
 		}, more, warnings, nil
 	}
 
@@ -445,6 +449,7 @@ func (c *Conn) ReadQueryResult(maxrows int, wantfields bool) (*sqltypes.Result, 
 				more = (packetOk.statusFlags & ServerMoreResultsExists) != 0
 				result.SessionStateChanges = packetOk.sessionStateData
 				result.StatusFlags = packetOk.statusFlags
+				result.Info = packetOk.info
 			}
 			return result, more, warnings, nil
 
@@ -464,7 +469,7 @@ func (c *Conn) ReadQueryResult(maxrows int, wantfields bool) (*sqltypes.Result, 
 		}
 
 		// Regular row.
-		row, err := c.parseRow(data, result.Fields, readLenEncStringAsBytesCopy)
+		row, err := c.parseRow(data, result.Fields, readLenEncStringAsBytesCopy, nil)
 		if err != nil {
 			c.recycleReadPacket()
 			return nil, false, 0, err
@@ -864,7 +869,11 @@ func (c *Conn) parseComStmtSendLongData(data []byte) (uint32, uint16, []byte, bo
 		return 0, 0, nil, false
 	}
 
-	return statementID, paramID, data[pos:], true
+	chunkData := data[pos:]
+	chunk := make([]byte, len(chunkData))
+	copy(chunk, chunkData)
+
+	return statementID, paramID, chunk, true
 }
 
 func (c *Conn) parseComStmtClose(data []byte) (uint32, bool) {

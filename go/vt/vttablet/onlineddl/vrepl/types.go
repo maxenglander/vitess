@@ -26,11 +26,10 @@ package vrepl
 import (
 	"fmt"
 	"reflect"
-	"strconv"
 	"strings"
 )
 
-// ColumnType enumerates some important column types
+// ColumnType indicated some MySQL data types
 type ColumnType int
 
 const (
@@ -38,62 +37,69 @@ const (
 	TimestampColumnType
 	DateTimeColumnType
 	EnumColumnType
+	SetColumnType
 	MediumIntColumnType
 	JSONColumnType
 	FloatColumnType
+	DoubleColumnType
+	BinaryColumnType
+	StringColumnType
+	IntegerColumnType
 )
-
-const maxMediumintUnsigned int32 = 16777215
-
-// TimezoneConversion indicates how to convert a timezone value
-type TimezoneConversion struct {
-	ToTimezone string
-}
 
 // Column represents a table column
 type Column struct {
-	Name               string
-	IsUnsigned         bool
-	Charset            string
-	Type               ColumnType
-	timezoneConversion *TimezoneConversion
+	Name                 string
+	IsUnsigned           bool
+	Charset              string
+	Collation            string
+	Type                 ColumnType
+	EnumValues           string
+	EnumToTextConversion bool
+	DataType             string // from COLUMN_TYPE column
+
+	IsNullable    bool
+	IsDefaultNull bool
+
+	CharacterMaximumLength int64
+	NumericPrecision       int64
+	NumericScale           int64
+	DateTimePrecision      int64
+
+	// add Octet length for binary type, fix bytes with suffix "00" get clipped in mysql binlog.
+	// https://github.com/github/gh-ost/issues/909
+	BinaryOctetLength uint64
 }
 
-func (c *Column) convertArg(arg interface{}) interface{} {
-	if s, ok := arg.(string); ok {
-		// string, charset conversion
-		if encoding, ok := charsetEncodingMap[c.Charset]; ok {
-			arg, _ = encoding.NewDecoder().String(s)
-		}
-		return arg
+// SetTypeIfUnknown will set a new column type only if the current type is unknown, otherwise silently skip
+func (c *Column) SetTypeIfUnknown(t ColumnType) {
+	if c.Type == UnknownColumnType {
+		c.Type = t
 	}
+}
 
-	if c.IsUnsigned {
-		if i, ok := arg.(int8); ok {
-			return uint8(i)
-		}
-		if i, ok := arg.(int16); ok {
-			return uint16(i)
-		}
-		if i, ok := arg.(int32); ok {
-			if c.Type == MediumIntColumnType {
-				// problem with mediumint is that it's a 3-byte type. There is no compatible golang type to match that.
-				// So to convert from negative to positive we'd need to convert the value manually
-				if i >= 0 {
-					return i
-				}
-				return uint32(maxMediumintUnsigned + i + 1)
-			}
-			return uint32(i)
-		}
-		if i, ok := arg.(int64); ok {
-			return strconv.FormatUint(uint64(i), 10)
-		}
-		if i, ok := arg.(int); ok {
-			return uint(i)
-		}
+// HasDefault returns true if the column at all has a default value (possibly NULL)
+func (c *Column) HasDefault() bool {
+	if c.IsDefaultNull && !c.IsNullable {
+		// based on INFORMATION_SCHEMA.COLUMNS, this is the indicator for a 'NOT NULL' column with no default value.
+		return false
 	}
-	return arg
+	return true
+}
+
+// IsNumeric returns true if the column is of a numeric type
+func (c *Column) IsNumeric() bool {
+	return c.NumericPrecision > 0
+}
+
+// IsFloatingPoint returns true if the column is of a floating point numeric type
+func (c *Column) IsFloatingPoint() bool {
+	return c.Type == FloatColumnType || c.Type == DoubleColumnType
+}
+
+// IsFloatingPoint returns true if the column is of a temporal type
+func (c *Column) IsTemporal() bool {
+	return c.DateTimePrecision >= 0
 }
 
 // NewColumns creates a new column array from non empty names
@@ -178,44 +184,10 @@ func (l *ColumnList) GetColumn(columnName string) *Column {
 	return nil
 }
 
-// SetUnsigned toggles on the unsigned property
-func (l *ColumnList) SetUnsigned(columnName string) {
-	l.GetColumn(columnName).IsUnsigned = true
-}
-
-// IsUnsigned returns true when the column is an unsigned numeral
-func (l *ColumnList) IsUnsigned(columnName string) bool {
-	return l.GetColumn(columnName).IsUnsigned
-}
-
-// SetCharset sets the charset property
-func (l *ColumnList) SetCharset(columnName string, charset string) {
-	l.GetColumn(columnName).Charset = charset
-}
-
-// GetCharset returns the hcarset property
-func (l *ColumnList) GetCharset(columnName string) string {
-	return l.GetColumn(columnName).Charset
-}
-
-// SetColumnType sets the type of the column (for interesting types)
-func (l *ColumnList) SetColumnType(columnName string, columnType ColumnType) {
-	l.GetColumn(columnName).Type = columnType
-}
-
-// GetColumnType gets type of column, for interesting types
-func (l *ColumnList) GetColumnType(columnName string) ColumnType {
-	return l.GetColumn(columnName).Type
-}
-
-// SetConvertDatetimeToTimestamp sets the timezone conversion
-func (l *ColumnList) SetConvertDatetimeToTimestamp(columnName string, toTimezone string) {
-	l.GetColumn(columnName).timezoneConversion = &TimezoneConversion{ToTimezone: toTimezone}
-}
-
-// HasTimezoneConversion sees if there's timezone conversion defined (only applicable to temporal values)
-func (l *ColumnList) HasTimezoneConversion(columnName string) bool {
-	return l.GetColumn(columnName).timezoneConversion != nil
+// ColumnExists returns true if this column list has a column by a given name
+func (l *ColumnList) ColumnExists(columnName string) bool {
+	_, ok := l.Ordinals[columnName]
+	return ok
 }
 
 // String returns a comma separated list of column names
@@ -244,9 +216,44 @@ func (l *ColumnList) IsSubsetOf(other *ColumnList) bool {
 	return true
 }
 
+// Difference returns a (new copy) subset of this column list, consisting of all
+// column NOT in given list.
+// The result is never nil, even if the difference is empty
+func (l *ColumnList) Difference(other *ColumnList) (diff *ColumnList) {
+	names := []string{}
+	for _, column := range l.columns {
+		if !other.ColumnExists(column.Name) {
+			names = append(names, column.Name)
+		}
+	}
+	return NewColumnList(names)
+}
+
 // Len returns the length of this list
 func (l *ColumnList) Len() int {
 	return len(l.columns)
+}
+
+// MappedNamesColumnList returns a column list based on this list, with names possibly mapped by given map
+func (l *ColumnList) MappedNamesColumnList(columnNamesMap map[string]string) *ColumnList {
+	names := l.Names()
+	for i := range names {
+		if mappedName, ok := columnNamesMap[names[i]]; ok {
+			names[i] = mappedName
+		}
+	}
+	return NewColumnList(names)
+}
+
+// SetEnumToTextConversion tells this column list that an enum is conveted to text
+func (l *ColumnList) SetEnumToTextConversion(columnName string, enumValues string) {
+	l.GetColumn(columnName).EnumToTextConversion = true
+	l.GetColumn(columnName).EnumValues = enumValues
+}
+
+// IsEnumToTextConversion tells whether an enum was converted to text
+func (l *ColumnList) IsEnumToTextConversion(columnName string) bool {
+	return l.GetColumn(columnName).EnumToTextConversion
 }
 
 // UniqueKey is the combination of a key's name and columns
@@ -254,6 +261,7 @@ type UniqueKey struct {
 	Name            string
 	Columns         ColumnList
 	HasNullable     bool
+	HasFloat        bool
 	IsAutoIncrement bool
 }
 

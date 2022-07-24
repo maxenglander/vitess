@@ -19,7 +19,7 @@ package filecustomrule
 
 import (
 	"flag"
-	"io/ioutil"
+	"os"
 	"path"
 	"time"
 
@@ -63,7 +63,7 @@ func NewFileCustomRule() (fcr *FileCustomRule) {
 // of error it returns nil and that error. A log will be printed to capture the
 // stage at which parsing failed.
 func ParseRules(path string) (*rules.Rules, error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Warningf("Error reading file %v: %v", path, err)
 		// Don't update any internal cache, just return error
@@ -109,43 +109,45 @@ func ActivateFileCustomRules(qsc tabletserver.Controller) {
 		qsc.RegisterQueryRuleSource(FileCustomRuleSource)
 		fileCustomRule.Open(qsc, *fileRulePath)
 
-		if *fileRuleShouldWatch {
-			baseDir := path.Dir(*fileRulePath)
-			ruleFileName := path.Base(*fileRulePath)
+		if !*fileRuleShouldWatch {
+			return
+		}
 
-			watcher, err := fsnotify.NewWatcher()
-			if err != nil {
-				log.Fatalf("Unable create new fsnotify watcher: %v", err)
-			}
-			servenv.OnTerm(func() { watcher.Close() })
+		baseDir := path.Dir(*fileRulePath)
+		ruleFileName := path.Base(*fileRulePath)
 
-			go func(tsc tabletserver.Controller) {
-				for {
-					select {
-					case evt, ok := <-watcher.Events:
-						if !ok {
-							return
-						}
-						if path.Base(evt.Name) != ruleFileName {
-							continue
-						}
-						if err := fileCustomRule.Open(tsc, *fileRulePath); err != nil {
-							log.Infof("Failed to load custom rules from %q: %v", *fileRulePath, err)
-						} else {
-							log.Infof("Loaded custom rules from %q", *fileRulePath)
-						}
-					case err, ok := <-watcher.Errors:
-						if !ok {
-							return
-						}
-						log.Errorf("Error watching %v: %v", *fileRulePath, err)
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			log.Fatalf("Unable create new fsnotify watcher: %v", err)
+		}
+		servenv.OnTerm(func() { watcher.Close() })
+
+		go func(tsc tabletserver.Controller) {
+			for {
+				select {
+				case evt, ok := <-watcher.Events:
+					if !ok {
+						return
 					}
+					if path.Base(evt.Name) != ruleFileName {
+						continue
+					}
+					if err := fileCustomRule.Open(tsc, *fileRulePath); err != nil {
+						log.Infof("Failed to load custom rules from %q: %v", *fileRulePath, err)
+					} else {
+						log.Infof("Loaded custom rules from %q", *fileRulePath)
+					}
+				case err, ok := <-watcher.Errors:
+					if !ok {
+						return
+					}
+					log.Errorf("Error watching %v: %v", *fileRulePath, err)
 				}
-			}(qsc)
-
-			if err = watcher.Add(baseDir); err != nil {
-				log.Fatalf("Unable to set up watcher for %v + %v: %v", baseDir, ruleFileName, err)
 			}
+		}(qsc)
+
+		if err = watcher.Add(baseDir); err != nil {
+			log.Fatalf("Unable to set up watcher for %v + %v: %v", baseDir, ruleFileName, err)
 		}
 	}
 }

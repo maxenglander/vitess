@@ -17,8 +17,15 @@ limitations under the License.
 package utils
 
 import (
+	"os"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"google.golang.org/protobuf/encoding/prototext"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -29,7 +36,7 @@ import (
 // Top declaration:
 //
 // var mustMatch = testutils.MustMatchFn(
-// 	[]interface{}{  // types with unexported fields
+// 	[]any{  // types with unexported fields
 // 		type1{},
 // 		type2{},
 // 		...
@@ -44,15 +51,18 @@ import (
 // In Test*() function:
 //
 // mustMatch(t, want, got, "something doesn't match")
-func MustMatchFn(ignoredFields ...string) func(t *testing.T, want, got interface{}, errMsg ...string) {
+func MustMatchFn(ignoredFields ...string) func(t *testing.T, want, got any, errMsg ...string) {
 	diffOpts := []cmp.Option{
+		cmp.Comparer(func(a, b proto.Message) bool {
+			return proto.Equal(a, b)
+		}),
 		cmp.Exporter(func(reflect.Type) bool {
 			return true
 		}),
 		cmpIgnoreFields(ignoredFields...),
 	}
 	// Diffs want/got and fails with errMsg on any failure.
-	return func(t *testing.T, want, got interface{}, errMsg ...string) {
+	return func(t *testing.T, want, got any, errMsg ...string) {
 		t.Helper()
 		diff := cmp.Diff(want, got, diffOpts...)
 		if diff != "" {
@@ -83,4 +93,30 @@ func cmpIgnoreFields(pathNames ...string) cmp.Option {
 		}
 		return false
 	}, cmp.Ignore())
+}
+
+func MustMatchPB(t *testing.T, expected string, pb proto.Message) {
+	t.Helper()
+
+	expectedPb := pb.ProtoReflect().New().Interface()
+	if err := prototext.Unmarshal([]byte(expected), expectedPb); err != nil {
+		t.Fatal(err)
+	}
+
+	MustMatch(t, expectedPb, pb)
+}
+
+func MakeTestOutput(t *testing.T, dir, pattern string) string {
+	testOutputTempDir, err := os.MkdirTemp(dir, pattern)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		if !t.Failed() {
+			_ = os.RemoveAll(testOutputTempDir)
+		} else {
+			t.Logf("Errors found in plantests. If the output is correct, run `cp %s/* testdata/` to update test expectations", testOutputTempDir)
+		}
+	})
+
+	return testOutputTempDir
 }

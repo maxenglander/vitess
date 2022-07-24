@@ -19,10 +19,16 @@ package vreplication
 import (
 	"flag"
 	"fmt"
+	"math"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	strings2 "k8s.io/utils/strings"
+
+	"vitess.io/vitess/go/timer"
+	"vitess.io/vitess/go/vt/sqlparser"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 
@@ -37,6 +43,7 @@ import (
 	"vitess.io/vitess/go/vt/mysqlctl"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 )
 
 var (
@@ -45,11 +52,12 @@ var (
 	// between the two timeouts.
 	idleTimeout = 1100 * time.Millisecond
 
-	dbLockRetryDelay    = 1 * time.Second
-	relayLogMaxSize     = flag.Int("relay_log_max_size", 250000, "Maximum buffer size (in bytes) for VReplication target buffering. If single rows are larger than this, a single row is buffered at a time.")
-	relayLogMaxItems    = flag.Int("relay_log_max_items", 5000, "Maximum number of rows for VReplication target buffering.")
-	copyTimeout         = 60 * time.Minute
-	replicaLagTolerance = 10 * time.Second
+	dbLockRetryDelay = 1 * time.Second
+	relayLogMaxSize  = flag.Int("relay_log_max_size", 250000, "Maximum buffer size (in bytes) for VReplication target buffering. If single rows are larger than this, a single row is buffered at a time.")
+	relayLogMaxItems = flag.Int("relay_log_max_items", 5000, "Maximum number of rows for VReplication target buffering.")
+
+	copyPhaseDuration   = flag.Duration("vreplication_copy_phase_duration", 60*time.Minute, "Duration for each copy phase loop (before running the next catchup: default 1h)")
+	replicaLagTolerance = flag.Duration("vreplication_replica_lag_tolerance", 1*time.Minute, "Replica lag threshold duration: once lag is below this we switch from copy phase to the replication (streaming) phase")
 
 	// vreplicationHeartbeatUpdateInterval determines how often the time_updated column is updated if there are no real events on the source and the source
 	// vstream is only sending heartbeats for this long. Keep this low if you expect high QPS and are monitoring this column to alert about potential
@@ -68,8 +76,33 @@ var (
 	vreplicationExperimentalFlags   = flag.Int64("vreplication_experimental_flags", 0x03, "Experimental features in vreplication to enable")
 	vreplicationParallelBulkInserts = flag.Int64("vreplication_parallel_bulk_inserts", 4, "Concurrent bulk inserts during copy")
 
-	vreplicationExperimentalOptimizeInserts        int64 = 0x01 // 0001
-	vreplicationExperimentalParallelizeBulkInserts int64 = 0x02 // 0010
+	vreplicationExperimentalFlagOptimizeInserts    int64 = 1
+	vreplicationExperimentalParallelizeBulkInserts int64 = 2
+
+	vreplicationStoreCompressedGTID = flag.Bool("vreplication_store_compressed_gtid", false, "Store compressed gtids in the pos column of _vt.vreplication")
+)
+
+const (
+	getSQLModeQuery = `SELECT @@session.sql_mode AS sql_mode`
+	// SQLMode should be used whenever performing a schema change as part of a vreplication
+	// workflow to ensure that you set a permissive SQL mode as defined by
+	// VReplication. We follow MySQL's model for recreating database objects
+	// on a target -- using SQL statements generated from a source -- which
+	// ensures that we can recreate them regardless of the sql_mode that was
+	// in effect on the source when it was created:
+	//   https://github.com/mysql/mysql-server/blob/3290a66c89eb1625a7058e0ef732432b6952b435/client/mysqldump.cc#L795-L818
+	SQLMode          = "NO_AUTO_VALUE_ON_ZERO"
+	StrictSQLMode    = "STRICT_ALL_TABLES,NO_AUTO_VALUE_ON_ZERO"
+	setSQLModeQueryf = `SET @@session.sql_mode='%s'`
+)
+
+type ComponentName string
+
+const (
+	VPlayerComponentName     ComponentName = "vplayer"
+	VCopierComponentName     ComponentName = "vcopier"
+	VStreamerComponentName   ComponentName = "vstreamer"
+	RowStreamerComponentName ComponentName = "rowstreamer"
 )
 
 // vreplicator provides the core logic to start vreplication streams
@@ -80,13 +113,19 @@ type vreplicator struct {
 	// source
 	source          *binlogdatapb.BinlogSource
 	sourceVStreamer VStreamerClient
-
-	stats *binlogplayer.Stats
+	state           string
+	stats           *binlogplayer.Stats
 	// mysqld is used to fetch the local schema.
-	mysqld    mysqlctl.MysqlDaemon
-	pkInfoMap map[string][]*PrimaryKeyInfo
+	mysqld     mysqlctl.MysqlDaemon
+	colInfoMap map[string][]*ColumnInfo
 
 	originalFKCheckSetting int64
+	originalSQLMode        string
+
+	WorkflowType int64
+	WorkflowName string
+
+	throttleUpdatesRateLimiter *timer.RateLimiter
 }
 
 // newVReplicator creates a new vreplicator. The valid fields from the source are:
@@ -101,8 +140,9 @@ type vreplicator struct {
 //   "select * from t where in_keyrange(col1, 'hash', '-80')",
 //   "select col1, col2 from t where...",
 //   "select col1, keyspace_id() as ksid from t where...",
-//   "select id, count(*), sum(price) from t group by id".
-//   Only "in_keyrange" expressions are supported in the where clause.
+//   "select id, count(*), sum(price) from t group by id",
+//   "select * from t where customer_id=1 and val = 'newton'".
+//   Only "in_keyrange" expressions, integer and string comparisons are supported in the where clause.
 //   The select expressions can be any valid non-aggregate expressions,
 //   or count(*), or sum(col).
 //   If the target column name does not match the source expression, an
@@ -122,6 +162,8 @@ func newVReplicator(id uint32, source *binlogdatapb.BinlogSource, sourceVStreame
 		stats:           stats,
 		dbClient:        newVDBClient(dbClient, stats),
 		mysqld:          mysqld,
+
+		throttleUpdatesRateLimiter: timer.NewRateLimiter(time.Second),
 	}
 }
 
@@ -150,25 +192,34 @@ func (vr *vreplicator) Replicate(ctx context.Context) error {
 	err := vr.replicate(ctx)
 	if err != nil {
 		msg := strings2.ShortenString(err.Error(), 1000)
-		log.Errorf("Replicate error: %s", msg)
-		if err := vr.setMessage(fmt.Sprintf("Error: %s", msg)); err != nil {
-			log.Errorf("Failed to set error state: %v", err)
+		if err := vr.setMessage(msg); err != nil {
+			binlogplayer.LogError("Failed to set error state", err)
 		}
 	}
 	return err
 }
 
 func (vr *vreplicator) replicate(ctx context.Context) error {
-	pkInfo, err := vr.buildPkInfoMap(ctx)
+	// Manage SQL_MODE in the same way that mysqldump does.
+	// Save the original sql_mode, set it to a permissive mode,
+	// and then reset it back to the original value at the end.
+	resetFunc, err := vr.setSQLMode(ctx)
+	defer resetFunc()
 	if err != nil {
 		return err
 	}
-	vr.pkInfoMap = pkInfo
+
+	colInfo, err := vr.buildColInfoMap(ctx)
+	if err != nil {
+		return err
+	}
+	vr.colInfoMap = colInfo
 	if err := vr.getSettingFKCheck(); err != nil {
 		return err
 	}
 	//defensive guard, should be a no-op since it should happen after copy is done
 	defer vr.resetFKCheckAfterCopy()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -183,11 +234,10 @@ func (vr *vreplicator) replicate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		// If any of the operations below changed state to Stopped, we should return.
-		if settings.State == binlogplayer.BlpStopped {
+		// If any of the operations below changed state to Stopped or Error, we should return.
+		if settings.State == binlogplayer.BlpStopped || settings.State == binlogplayer.BlpError {
 			return nil
 		}
-
 		switch {
 		case numTablesToCopy != 0:
 			if err := vr.clearFKCheck(); err != nil {
@@ -197,6 +247,15 @@ func (vr *vreplicator) replicate(ctx context.Context) error {
 			if err := newVCopier(vr).copyNext(ctx, settings); err != nil {
 				vr.stats.ErrorCounts.Add([]string{"Copy"}, 1)
 				return err
+			}
+			settings, numTablesToCopy, err = vr.readSettings(ctx)
+			if err != nil {
+				return err
+			}
+			if numTablesToCopy == 0 {
+				if err := vr.insertLog(LogCopyEnd, fmt.Sprintf("Copy phase completed at gtid %s", settings.StartPos)); err != nil {
+					return err
+				}
 			}
 		case settings.StartPos.IsZero():
 			if err := newVCopier(vr).initTablesForCopy(ctx); err != nil {
@@ -220,24 +279,26 @@ func (vr *vreplicator) replicate(ctx context.Context) error {
 	}
 }
 
-// PrimaryKeyInfo is used to store charset and collation for primary keys where applicable
-type PrimaryKeyInfo struct {
-	Name       string
-	CharSet    string
-	Collation  string
-	DataType   string
-	ColumnType string
+// ColumnInfo is used to store charset and collation
+type ColumnInfo struct {
+	Name        string
+	CharSet     string
+	Collation   string
+	DataType    string
+	ColumnType  string
+	IsPK        bool
+	IsGenerated bool
 }
 
-func (vr *vreplicator) buildPkInfoMap(ctx context.Context) (map[string][]*PrimaryKeyInfo, error) {
-	schema, err := vr.mysqld.GetSchema(ctx, vr.dbClient.DBName(), []string{"/.*/"}, nil, false)
+func (vr *vreplicator) buildColInfoMap(ctx context.Context) (map[string][]*ColumnInfo, error) {
+	req := &tabletmanagerdatapb.GetSchemaRequest{Tables: []string{"/.*/"}}
+	schema, err := vr.mysqld.GetSchema(ctx, vr.dbClient.DBName(), req)
 	if err != nil {
 		return nil, err
 	}
-	queryTemplate := "select character_set_name, collation_name, column_name, data_type, column_type from information_schema.columns where table_schema=%s and table_name=%s;"
-	pkInfoMap := make(map[string][]*PrimaryKeyInfo)
+	queryTemplate := "select character_set_name, collation_name, column_name, data_type, column_type, extra from information_schema.columns where table_schema=%s and table_name=%s;"
+	colInfoMap := make(map[string][]*ColumnInfo)
 	for _, td := range schema.TableDefinitions {
-
 		query := fmt.Sprintf(queryTemplate, encodeString(vr.dbClient.DBName()), encodeString(td.Name))
 		qr, err := vr.mysqld.FetchSuperQuery(ctx, query)
 		if err != nil {
@@ -249,51 +310,68 @@ func (vr *vreplicator) buildPkInfoMap(ctx context.Context) (map[string][]*Primar
 
 		var pks []string
 		if len(td.PrimaryKeyColumns) != 0 {
+			// Use the PK
 			pks = td.PrimaryKeyColumns
 		} else {
-			pks = td.Columns
+			// Use a PK equivalent if one exists
+			if pks, err = vr.mysqld.GetPrimaryKeyEquivalentColumns(ctx, vr.dbClient.DBName(), td.Name); err != nil {
+				return nil, err
+			}
+			// Fall back to using every column in the table if there's no PK or PKE
+			if len(pks) == 0 {
+				pks = td.Columns
+			}
 		}
-		var pkInfos []*PrimaryKeyInfo
-		for _, pk := range pks {
+		var colInfo []*ColumnInfo
+		for _, row := range qr.Rows {
 			charSet := ""
 			collation := ""
+			columnName := ""
+			isPK := false
+			isGenerated := false
 			var dataType, columnType string
-			for _, row := range qr.Rows {
-				columnName := row[2].ToString()
-				if strings.EqualFold(columnName, pk) {
-					var currentField *querypb.Field
-					for _, field := range td.Fields {
-						if field.Name == pk {
-							currentField = field
-							break
-						}
-					}
-					if currentField == nil {
-						continue
-					}
-					dataType = row[3].ToString()
-					columnType = row[4].ToString()
-					if sqltypes.IsText(currentField.Type) {
-						charSet = row[0].ToString()
-						collation = row[1].ToString()
-					}
+			columnName = row[2].ToString()
+			var currentField *querypb.Field
+			for _, field := range td.Fields {
+				if field.Name == columnName {
+					currentField = field
 					break
 				}
 			}
-			if dataType == "" || columnType == "" {
-				return nil, fmt.Errorf("no dataType/columnType found in information_schema.columns for table %s, column %s", td.Name, pk)
+			if currentField == nil {
+				continue
 			}
-			pkInfos = append(pkInfos, &PrimaryKeyInfo{
-				Name:       pk,
-				CharSet:    charSet,
-				Collation:  collation,
-				DataType:   dataType,
-				ColumnType: columnType,
+			dataType = row[3].ToString()
+			columnType = row[4].ToString()
+			if sqltypes.IsText(currentField.Type) {
+				charSet = row[0].ToString()
+				collation = row[1].ToString()
+			}
+			if dataType == "" || columnType == "" {
+				return nil, fmt.Errorf("no dataType/columnType found in information_schema.columns for table %s, column %s", td.Name, columnName)
+			}
+			for _, pk := range pks {
+				if columnName == pk {
+					isPK = true
+				}
+			}
+			extra := strings.ToLower(row[5].ToString())
+			if strings.Contains(extra, "stored generated") || strings.Contains(extra, "virtual generated") {
+				isGenerated = true
+			}
+			colInfo = append(colInfo, &ColumnInfo{
+				Name:        columnName,
+				CharSet:     charSet,
+				Collation:   collation,
+				DataType:    dataType,
+				ColumnType:  columnType,
+				IsPK:        isPK,
+				IsGenerated: isGenerated,
 			})
 		}
-		pkInfoMap[td.Name] = pkInfos
+		colInfoMap[td.Name] = colInfo
 	}
-	return pkInfoMap, nil
+	return colInfoMap, nil
 }
 
 func (vr *vreplicator) readSettings(ctx context.Context) (settings binlogplayer.VRSettings, numTablesToCopy int64, err error) {
@@ -303,7 +381,7 @@ func (vr *vreplicator) readSettings(ctx context.Context) (settings binlogplayer.
 	}
 
 	query := fmt.Sprintf("select count(*) from _vt.copy_state where vrepl_id=%d", vr.id)
-	qr, err := withDDL.Exec(ctx, query, vr.dbClient.ExecuteFetch)
+	qr, err := withDDL.Exec(ctx, query, vr.dbClient.ExecuteFetch, vr.dbClient.ExecuteFetch)
 	if err != nil {
 		return settings, numTablesToCopy, err
 	}
@@ -314,19 +392,31 @@ func (vr *vreplicator) readSettings(ctx context.Context) (settings binlogplayer.
 	if err != nil {
 		return settings, numTablesToCopy, err
 	}
+	vr.WorkflowType = settings.WorkflowType
+	vr.WorkflowName = settings.WorkflowName
 	return settings, numTablesToCopy, nil
 }
 
 func (vr *vreplicator) setMessage(message string) error {
+	message = binlogplayer.MessageTruncate(message)
 	vr.stats.History.Add(&binlogplayer.StatsHistoryRecord{
 		Time:    time.Now(),
 		Message: message,
 	})
-	query := fmt.Sprintf("update _vt.vreplication set message=%v where id=%v", encodeString(binlogplayer.MessageTruncate(message)), vr.id)
+	buf := sqlparser.NewTrackedBuffer(nil)
+	buf.Myprintf("update _vt.vreplication set message=%s where id=%s", encodeString(message), strconv.Itoa(int(vr.id)))
+	query := buf.ParsedQuery().Query
 	if _, err := vr.dbClient.Execute(query); err != nil {
 		return fmt.Errorf("could not set message: %v: %v", query, err)
 	}
+	if err := insertLog(vr.dbClient, LogMessage, vr.id, vr.state, message); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (vr *vreplicator) insertLog(typ, message string) error {
+	return insertLog(vr.dbClient, typ, vr.id, vr.state, message)
 }
 
 func (vr *vreplicator) setState(state, message string) error {
@@ -341,6 +431,14 @@ func (vr *vreplicator) setState(state, message string) error {
 	if _, err := vr.dbClient.ExecuteFetch(query, 1); err != nil {
 		return fmt.Errorf("could not set state: %v: %v", query, err)
 	}
+	if state == vr.state {
+		return nil
+	}
+	if err := insertLog(vr.dbClient, LogStateChange, vr.id, state, message); err != nil {
+		return err
+	}
+	vr.state = state
+
 	return nil
 }
 
@@ -370,7 +468,109 @@ func (vr *vreplicator) resetFKCheckAfterCopy() error {
 	return err
 }
 
+func (vr *vreplicator) setSQLMode(ctx context.Context) (func(), error) {
+	resetFunc := func() {}
+	// First save the original SQL mode if we have not already done so
+	if vr.originalSQLMode == "" {
+		res, err := vr.dbClient.Execute(getSQLModeQuery)
+		if err != nil || len(res.Rows) != 1 {
+			return resetFunc, fmt.Errorf("could not get the original sql_mode on target: %v", err)
+		}
+		vr.originalSQLMode = res.Named().Row().AsString("sql_mode", "")
+	}
+
+	// Create a callback function for resetting the original
+	// SQL mode back at the end of the vreplication operation.
+	// You should defer this callback wherever you call setSQLMode()
+	resetFunc = func() {
+		query := fmt.Sprintf(setSQLModeQueryf, vr.originalSQLMode)
+		_, err := vr.dbClient.Execute(query)
+		if err != nil {
+			log.Warningf("could not reset sql_mode on target using %s: %v", query, err)
+		}
+	}
+	vreplicationSQLMode := SQLMode
+	settings, _, err := vr.readSettings(ctx)
+	if err != nil {
+		return resetFunc, err
+	}
+	if settings.WorkflowType == int64(binlogdatapb.VReplicationWorkflowType_ONLINEDDL) {
+		vreplicationSQLMode = StrictSQLMode
+	}
+
+	// Now set it to a permissive mode that will allow us to recreate
+	// any database object that exists on the source in full on the
+	// target
+	query := fmt.Sprintf(setSQLModeQueryf, vreplicationSQLMode)
+	if _, err := vr.dbClient.Execute(query); err != nil {
+		return resetFunc, fmt.Errorf("could not set the permissive sql_mode on target using %s: %v", query, err)
+	}
+
+	return resetFunc, nil
+}
+
+// throttlerAppName returns the app name to be used by throttlerClient for this particular workflow
+// example results:
+// - "vreplication" for most flows
+// - "vreplication:online-ddl" for online ddl flows.
+//   Note that with such name, it's possible to throttle
+//   the worflow by either /throttler/throttle-app?app=vreplication and/or /throttler/throttle-app?app=online-ddl
+//   This is useful when we want to throttle all migrations. We throttle "online-ddl" and that applies to both vreplication
+//   migrations as well as gh-ost migrations.
+func (vr *vreplicator) throttlerAppName() string {
+	names := []string{vr.WorkflowName, throttlerVReplicationAppName}
+	if vr.WorkflowType == int64(binlogdatapb.VReplicationWorkflowType_ONLINEDDL) {
+		names = append(names, throttlerOnlineDDLAppName)
+	}
+	return strings.Join(names, ":")
+}
+
+func (vr *vreplicator) updateTimeThrottled(componentThrottled ComponentName) error {
+	err := vr.throttleUpdatesRateLimiter.Do(func() error {
+		tm := time.Now().Unix()
+		update, err := binlogplayer.GenerateUpdateTimeThrottled(vr.id, tm, string(componentThrottled))
+		if err != nil {
+			return err
+		}
+		if _, err := withDDL.Exec(vr.vre.ctx, update, vr.dbClient.ExecuteFetch, vr.dbClient.ExecuteFetch); err != nil {
+			return fmt.Errorf("error %v updating time throttled", err)
+		}
+		return nil
+	})
+	return err
+}
+
+func (vr *vreplicator) updateHeartbeatTime(tm int64) error {
+	update, err := binlogplayer.GenerateUpdateHeartbeat(vr.id, tm)
+	if err != nil {
+		return err
+	}
+	if _, err := withDDL.Exec(vr.vre.ctx, update, vr.dbClient.ExecuteFetch, vr.dbClient.ExecuteFetch); err != nil {
+		return fmt.Errorf("error %v updating time", err)
+	}
+	return nil
+}
+
 func (vr *vreplicator) clearFKCheck() error {
 	_, err := vr.dbClient.Execute("set foreign_key_checks=0;")
 	return err
+}
+
+func recalculatePKColsInfoByColumnNames(uniqueKeyColumnNames []string, colInfos []*ColumnInfo) (pkColInfos []*ColumnInfo) {
+	pkColInfos = colInfos[:]
+	columnOrderMap := map[string]int64{}
+	for _, colInfo := range pkColInfos {
+		columnOrderMap[colInfo.Name] = math.MaxInt64
+	}
+
+	isPKMap := map[string]bool{}
+	for i, colName := range uniqueKeyColumnNames {
+		columnOrderMap[colName] = int64(i)
+		isPKMap[colName] = true
+	}
+	sort.SliceStable(pkColInfos, func(i, j int) bool { return columnOrderMap[pkColInfos[i].Name] < columnOrderMap[pkColInfos[j].Name] })
+	for i := range pkColInfos {
+		pkColInfos[i].IsPK = isPKMap[pkColInfos[i].Name]
+	}
+	return pkColInfos
 }

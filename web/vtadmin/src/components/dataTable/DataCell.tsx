@@ -21,7 +21,7 @@ interface Props
 
 export const DataCell: React.FunctionComponent<Props> = ({ children, className, ...tdProps }) => {
     return (
-        <td {...tdProps} className={cx(className, 'font-family-monospace')}>
+        <td {...tdProps} className={cx(className, 'font-mono leading-8')}>
             {children}
         </td>
     );

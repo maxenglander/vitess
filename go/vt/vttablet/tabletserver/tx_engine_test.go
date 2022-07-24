@@ -135,7 +135,7 @@ func TestTxEngineClose(t *testing.T) {
 	te.AcceptReadWrite()
 	_, err = te.Reserve(ctx, &querypb.ExecuteOptions{}, 0, nil)
 	require.NoError(t, err)
-	_, err = te.ReserveBegin(ctx, &querypb.ExecuteOptions{}, nil)
+	_, err = te.ReserveBegin(ctx, &querypb.ExecuteOptions{}, nil, nil)
 	require.NoError(t, err)
 	start = time.Now()
 	te.Close()
@@ -151,20 +151,41 @@ func TestTxEngineBegin(t *testing.T) {
 	config := tabletenv.NewDefaultConfig()
 	config.DB = newDBConfigs(db)
 	te := NewTxEngine(tabletenv.NewEnv(config, "TabletServerTest"))
-	te.AcceptReadOnly()
-	tx1, _, err := te.Begin(ctx, nil, 0, &querypb.ExecuteOptions{})
-	require.NoError(t, err)
-	_, _, err = te.Commit(ctx, tx1)
-	require.NoError(t, err)
-	require.Equal(t, "start transaction read only;commit", db.QueryLog())
-	db.ResetQueryLog()
 
-	te.AcceptReadWrite()
-	tx2, _, err := te.Begin(ctx, nil, 0, &querypb.ExecuteOptions{})
-	require.NoError(t, err)
-	_, _, err = te.Commit(ctx, tx2)
-	require.NoError(t, err)
-	require.Equal(t, "begin;commit", db.QueryLog())
+	for _, exec := range []func() (int64, error){
+		func() (int64, error) {
+			tx, _, err := te.Begin(ctx, nil, 0, &querypb.ExecuteOptions{})
+			return tx, err
+		},
+		func() (int64, error) {
+			return te.ReserveBegin(ctx, &querypb.ExecuteOptions{}, nil, nil)
+		},
+	} {
+		te.AcceptReadOnly()
+		tx1, err := exec()
+		require.NoError(t, err)
+		_, _, err = te.Commit(ctx, tx1)
+		require.NoError(t, err)
+		requireLogs(t, db.QueryLog(), "start transaction read only", "commit")
+		db.ResetQueryLog()
+
+		te.AcceptReadWrite()
+		tx2, err := exec()
+		require.NoError(t, err)
+		_, _, err = te.Commit(ctx, tx2)
+		require.NoError(t, err)
+		requireLogs(t, db.QueryLog(), "begin", "commit")
+		db.ResetQueryLog()
+
+		te.transition(Transitioning)
+		_, err = exec()
+		assert.EqualError(t, err, "tx engine can't accept new connections in state Transitioning")
+
+		te.transition(NotServing)
+		_, err = exec()
+		assert.EqualError(t, err, "tx engine can't accept new connections in state NotServing")
+	}
+
 }
 
 func TestTxEngineRenewFails(t *testing.T) {
@@ -176,7 +197,7 @@ func TestTxEngineRenewFails(t *testing.T) {
 	te := NewTxEngine(tabletenv.NewEnv(config, "TabletServerTest"))
 	te.AcceptReadOnly()
 	options := &querypb.ExecuteOptions{}
-	connID, err := te.ReserveBegin(ctx, options, nil)
+	connID, err := te.ReserveBegin(ctx, options, nil, nil)
 	require.NoError(t, err)
 
 	conn, err := te.txPool.GetAndLock(connID, "for test")
@@ -545,10 +566,10 @@ func TestTxEngineFailReserve(t *testing.T) {
 
 	options := &querypb.ExecuteOptions{}
 	_, err := te.Reserve(ctx, options, 0, nil)
-	assert.EqualError(t, err, "cannot provide new connection in state NotServing")
+	assert.EqualError(t, err, "tx engine can't accept new connections in state NotServing")
 
-	_, err = te.ReserveBegin(ctx, options, nil)
-	assert.EqualError(t, err, "cannot provide new connection in state NotServing")
+	_, err = te.ReserveBegin(ctx, options, nil, nil)
+	assert.EqualError(t, err, "tx engine can't accept new connections in state NotServing")
 
 	te.AcceptReadOnly()
 
@@ -556,7 +577,7 @@ func TestTxEngineFailReserve(t *testing.T) {
 	_, err = te.Reserve(ctx, options, 0, []string{"dummy_query"})
 	assert.EqualError(t, err, "unknown error: failed executing dummy_query (errno 1105) (sqlstate HY000) during query: dummy_query")
 
-	_, err = te.ReserveBegin(ctx, options, []string{"dummy_query"})
+	_, err = te.ReserveBegin(ctx, options, []string{"dummy_query"}, nil)
 	assert.EqualError(t, err, "unknown error: failed executing dummy_query (errno 1105) (sqlstate HY000) during query: dummy_query")
 
 	nonExistingID := int64(42)

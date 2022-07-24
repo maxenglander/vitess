@@ -17,6 +17,7 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -60,10 +61,10 @@ func TestPulloutSubqueryValueGood(t *testing.T) {
 		Underlying:     ufp,
 	}
 
-	result, err := ps.Execute(nil, bindVars, false)
+	result, err := ps.TryExecute(context.Background(), &noopVCursor{}, bindVars, false)
 	require.NoError(t, err)
-	sfp.ExpectLog(t, []string{`Execute aa: type:INT64 value:"1"  false`})
-	ufp.ExpectLog(t, []string{`Execute aa: type:INT64 value:"1" sq: type:INT64 value:"1"  false`})
+	sfp.ExpectLog(t, []string{`Execute aa: type:INT64 value:"1" false`})
+	ufp.ExpectLog(t, []string{`Execute aa: type:INT64 value:"1" sq: type:INT64 value:"1" false`})
 	expectResult(t, "ps.Execute", result, underlyingResult)
 }
 
@@ -85,7 +86,7 @@ func TestPulloutSubqueryValueNone(t *testing.T) {
 		Underlying:     ufp,
 	}
 
-	if _, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false); err != nil {
+	if _, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false); err != nil {
 		t.Error(err)
 	}
 	sfp.ExpectLog(t, []string{`Execute  false`})
@@ -109,7 +110,7 @@ func TestPulloutSubqueryValueBadColumns(t *testing.T) {
 		Subquery:       sfp,
 	}
 
-	_, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false)
+	_, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false)
 	require.EqualError(t, err, "subquery returned more than one column")
 }
 
@@ -131,7 +132,7 @@ func TestPulloutSubqueryValueBadRows(t *testing.T) {
 		Subquery:       sfp,
 	}
 
-	_, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false)
+	_, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false)
 	require.EqualError(t, err, "subquery returned more than one row")
 }
 
@@ -156,21 +157,21 @@ func TestPulloutSubqueryInNotinGood(t *testing.T) {
 		Underlying:     ufp,
 	}
 
-	if _, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false); err != nil {
+	if _, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false); err != nil {
 		t.Error(err)
 	}
 	sfp.ExpectLog(t, []string{`Execute  false`})
-	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"1" sq: type:TUPLE values:<type:INT64 value:"1" > values:<type:INT64 value:"2" >  false`})
+	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"1" sq: type:TUPLE values:{type:INT64 value:"1"} values:{type:INT64 value:"2"} false`})
 
 	// Test the NOT IN case just once even though it's common code.
 	sfp.rewind()
 	ufp.rewind()
 	ps.Opcode = PulloutNotIn
-	if _, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false); err != nil {
+	if _, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false); err != nil {
 		t.Error(err)
 	}
 	sfp.ExpectLog(t, []string{`Execute  false`})
-	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"1" sq: type:TUPLE values:<type:INT64 value:"1" > values:<type:INT64 value:"2" >  false`})
+	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"1" sq: type:TUPLE values:{type:INT64 value:"1"} values:{type:INT64 value:"2"} false`})
 }
 
 func TestPulloutSubqueryInNone(t *testing.T) {
@@ -192,11 +193,11 @@ func TestPulloutSubqueryInNone(t *testing.T) {
 		Underlying:     ufp,
 	}
 
-	if _, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false); err != nil {
+	if _, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false); err != nil {
 		t.Error(err)
 	}
 	sfp.ExpectLog(t, []string{`Execute  false`})
-	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"0" sq: type:TUPLE values:<type:INT64 value:"0" >  false`})
+	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"0" sq: type:TUPLE values:{type:INT64 value:"0"} false`})
 }
 
 func TestPulloutSubqueryInBadColumns(t *testing.T) {
@@ -216,7 +217,7 @@ func TestPulloutSubqueryInBadColumns(t *testing.T) {
 		Subquery:       sfp,
 	}
 
-	_, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false)
+	_, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false)
 	require.EqualError(t, err, "subquery returned more than one column")
 }
 
@@ -239,11 +240,11 @@ func TestPulloutSubqueryExists(t *testing.T) {
 		Underlying: ufp,
 	}
 
-	if _, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false); err != nil {
+	if _, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false); err != nil {
 		t.Error(err)
 	}
 	sfp.ExpectLog(t, []string{`Execute  false`})
-	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"1"  false`})
+	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"1" false`})
 }
 
 func TestPulloutSubqueryExistsNone(t *testing.T) {
@@ -264,11 +265,11 @@ func TestPulloutSubqueryExistsNone(t *testing.T) {
 		Underlying: ufp,
 	}
 
-	if _, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false); err != nil {
+	if _, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false); err != nil {
 		t.Error(err)
 	}
 	sfp.ExpectLog(t, []string{`Execute  false`})
-	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"0"  false`})
+	ufp.ExpectLog(t, []string{`Execute has_values: type:INT64 value:"0" false`})
 }
 
 func TestPulloutSubqueryError(t *testing.T) {
@@ -281,7 +282,7 @@ func TestPulloutSubqueryError(t *testing.T) {
 		Subquery:       sfp,
 	}
 
-	_, err := ps.Execute(nil, make(map[string]*querypb.BindVariable), false)
+	_, err := ps.TryExecute(context.Background(), &noopVCursor{}, make(map[string]*querypb.BindVariable), false)
 	require.EqualError(t, err, "err")
 }
 
@@ -316,10 +317,10 @@ func TestPulloutSubqueryStream(t *testing.T) {
 		Underlying:     ufp,
 	}
 
-	result, err := wrapStreamExecute(ps, nil, bindVars, false)
+	result, err := wrapStreamExecute(ps, &noopVCursor{}, bindVars, true)
 	require.NoError(t, err)
-	sfp.ExpectLog(t, []string{`Execute aa: type:INT64 value:"1"  false`})
-	ufp.ExpectLog(t, []string{`StreamExecute aa: type:INT64 value:"1" sq: type:INT64 value:"1"  false`})
+	sfp.ExpectLog(t, []string{`Execute aa: type:INT64 value:"1" false`})
+	ufp.ExpectLog(t, []string{`StreamExecute aa: type:INT64 value:"1" sq: type:INT64 value:"1" true`})
 	expectResult(t, "ps.StreamExecute", result, underlyingResult)
 }
 
@@ -335,7 +336,7 @@ func TestPulloutSubqueryGetFields(t *testing.T) {
 		Underlying:     ufp,
 	}
 
-	if _, err := ps.GetFields(nil, bindVars); err != nil {
+	if _, err := ps.GetFields(context.Background(), nil, bindVars); err != nil {
 		t.Error(err)
 	}
 	ufp.ExpectLog(t, []string{
@@ -345,31 +346,31 @@ func TestPulloutSubqueryGetFields(t *testing.T) {
 
 	ufp.rewind()
 	ps.Opcode = PulloutIn
-	if _, err := ps.GetFields(nil, bindVars); err != nil {
+	if _, err := ps.GetFields(context.Background(), nil, bindVars); err != nil {
 		t.Error(err)
 	}
 	ufp.ExpectLog(t, []string{
-		`GetFields aa: type:INT64 value:"1" has_values: type:INT64 value:"0" sq: type:TUPLE values:<type:INT64 value:"0" > `,
-		`Execute aa: type:INT64 value:"1" has_values: type:INT64 value:"0" sq: type:TUPLE values:<type:INT64 value:"0" >  true`,
+		`GetFields aa: type:INT64 value:"1" has_values: type:INT64 value:"0" sq: type:TUPLE values:{type:INT64 value:"0"}`,
+		`Execute aa: type:INT64 value:"1" has_values: type:INT64 value:"0" sq: type:TUPLE values:{type:INT64 value:"0"} true`,
 	})
 
 	ufp.rewind()
 	ps.Opcode = PulloutNotIn
-	if _, err := ps.GetFields(nil, bindVars); err != nil {
+	if _, err := ps.GetFields(context.Background(), nil, bindVars); err != nil {
 		t.Error(err)
 	}
 	ufp.ExpectLog(t, []string{
-		`GetFields aa: type:INT64 value:"1" has_values: type:INT64 value:"0" sq: type:TUPLE values:<type:INT64 value:"0" > `,
-		`Execute aa: type:INT64 value:"1" has_values: type:INT64 value:"0" sq: type:TUPLE values:<type:INT64 value:"0" >  true`,
+		`GetFields aa: type:INT64 value:"1" has_values: type:INT64 value:"0" sq: type:TUPLE values:{type:INT64 value:"0"}`,
+		`Execute aa: type:INT64 value:"1" has_values: type:INT64 value:"0" sq: type:TUPLE values:{type:INT64 value:"0"} true`,
 	})
 
 	ufp.rewind()
 	ps.Opcode = PulloutExists
-	if _, err := ps.GetFields(nil, bindVars); err != nil {
+	if _, err := ps.GetFields(context.Background(), nil, bindVars); err != nil {
 		t.Error(err)
 	}
 	ufp.ExpectLog(t, []string{
-		`GetFields aa: type:INT64 value:"1" has_values: type:INT64 value:"0" `,
-		`Execute aa: type:INT64 value:"1" has_values: type:INT64 value:"0"  true`,
+		`GetFields aa: type:INT64 value:"1" has_values: type:INT64 value:"0"`,
+		`Execute aa: type:INT64 value:"1" has_values: type:INT64 value:"0" true`,
 	})
 }

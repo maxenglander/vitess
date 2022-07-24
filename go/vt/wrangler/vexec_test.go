@@ -28,7 +28,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/logutil"
 )
 
@@ -43,14 +42,14 @@ func TestVExec(t *testing.T) {
 	wr := New(logger, env.topoServ, env.tmc)
 
 	vx := newVExec(ctx, workflow, keyspace, query, wr)
-	err := vx.getMasters()
+	err := vx.getPrimaries()
 	require.Nil(t, err)
-	masters := vx.masters
-	require.NotNil(t, masters)
-	require.Equal(t, len(masters), 2)
+	primaries := vx.primaries
+	require.NotNil(t, primaries)
+	require.Equal(t, len(primaries), 2)
 	var shards []string
-	for _, master := range masters {
-		shards = append(shards, master.Shard)
+	for _, primary := range primaries {
+		shards = append(shards, primary.Shard)
 	}
 	sort.Strings(shards)
 	require.Equal(t, fmt.Sprintf("%v", shards), "[-80 80-]")
@@ -90,7 +89,7 @@ func TestVExec(t *testing.T) {
 	result = sqltypes.MakeTestResult(sqltypes.MakeTestFields(
 		"id|source|message|cell|tablet_types",
 		"int64|varchar|varchar|varchar|varchar"),
-		"1|keyspace:\"source\" shard:\"0\" filter:<rules:<match:\"t1\" > > |||",
+		"1|keyspace:\"source\" shard:\"0\" filter:{rules:{match:\"t1\"}}|||",
 	)
 	testCases = append(testCases, &TestCase{
 		name:   "select",
@@ -136,7 +135,9 @@ func TestVExec(t *testing.T) {
 			if testCase.errorString == "" {
 				require.NoError(t, err)
 				for _, result := range results {
-					utils.MustMatch(t, testCase.result, result, "Incorrect result")
+					if !testCase.result.Equal(result) {
+						t.Errorf("mismatched result:\nwant: %v\ngot:  %v", testCase.result, result)
+					}
 				}
 			} else {
 				require.Error(t, err)
@@ -153,15 +154,15 @@ func TestVExec(t *testing.T) {
 	dryRunResults := []string{
 		"Query: delete from _vt.vreplication where db_name = 'vt_target' and workflow = 'wrWorkflow'",
 		"will be run on the following streams in keyspace target for workflow wrWorkflow:\n\n",
-		"+----------------------+----+--------------------------------+---------+-----------+--------------+",
-		"|        TABLET        | ID |          BINLOGSOURCE          |  STATE  |  DBNAME   | CURRENT GTID |",
-		"+----------------------+----+--------------------------------+---------+-----------+--------------+",
-		"| -80/zone1-0000000200 |  1 | keyspace:\"source\" shard:\"0\"    | Copying | vt_target | pos          |",
-		"|                      |    | filter:<rules:<match:\"t1\" > >  |         |           |              |",
-		"+----------------------+----+--------------------------------+---------+-----------+--------------+",
-		"| 80-/zone1-0000000210 |  1 | keyspace:\"source\" shard:\"0\"    | Copying | vt_target | pos          |",
-		"|                      |    | filter:<rules:<match:\"t1\" > >  |         |           |              |",
-		"+----------------------+----+--------------------------------+---------+-----------+--------------+",
+		`+----------------------+----+--------------------------------+---------+-----------+------------------------------------------+
+|        TABLET        | ID |          BINLOGSOURCE          |  STATE  |  DBNAME   |               CURRENT GTID               |
++----------------------+----+--------------------------------+---------+-----------+------------------------------------------+
+| -80/zone1-0000000200 |  1 | keyspace:"source" shard:"0"    | Copying | vt_target | 14b68925-696a-11ea-aee7-fec597a91f5e:1-3 |
+|                      |    | filter:{rules:{match:"t1"}}    |         |           |                                          |
++----------------------+----+--------------------------------+---------+-----------+------------------------------------------+
+| 80-/zone1-0000000210 |  1 | keyspace:"source" shard:"0"    | Copying | vt_target | 14b68925-696a-11ea-aee7-fec597a91f5e:1-3 |
+|                      |    | filter:{rules:{match:"t1"}}    |         |           |                                          |
++----------------------+----+--------------------------------+---------+-----------+------------------------------------------+`,
 	}
 	require.Equal(t, strings.Join(dryRunResults, "\n")+"\n\n\n\n\n", logger.String())
 }
@@ -171,7 +172,7 @@ func TestWorkflowStatusUpdate(t *testing.T) {
 	require.Equal(t, "Running", updateState("", "Running", nil, int64(time.Now().Second())))
 	require.Equal(t, "Lagging", updateState("", "Running", nil, int64(time.Now().Second())-100))
 	require.Equal(t, "Copying", updateState("", "Running", []copyState{{Table: "t1", LastPK: "[[INT64(10)]]"}}, int64(time.Now().Second())))
-	require.Equal(t, "Error", updateState("error: master tablet not contactable", "Running", nil, 0))
+	require.Equal(t, "Error", updateState("error: primary tablet not contactable", "Running", nil, 0))
 }
 
 func TestWorkflowListStreams(t *testing.T) {
@@ -210,9 +211,11 @@ func TestWorkflowListStreams(t *testing.T) {
 		]
 	},
 	"MaxVReplicationLag": 0,
+	"MaxVReplicationTransactionLag": 0,
+	"Frozen": false,
 	"ShardStatuses": {
 		"-80/zone1-0000000200": {
-			"MasterReplicationStatuses": [
+			"PrimaryReplicationStatuses": [
 				{
 					"Shard": "-80",
 					"Tablet": "zone1-0000000200",
@@ -228,13 +231,17 @@ func TestWorkflowListStreams(t *testing.T) {
 							]
 						}
 					},
-					"Pos": "pos",
+					"Pos": "14b68925-696a-11ea-aee7-fec597a91f5e:1-3",
 					"StopPos": "",
 					"State": "Copying",
 					"DBName": "vt_target",
 					"TransactionTimestamp": 0,
 					"TimeUpdated": 1234,
+					"TimeHeartbeat": 1234,
+					"TimeThrottled": 0,
+					"ComponentThrottled": "",
 					"Message": "",
+					"Tags": "",
 					"CopyState": [
 						{
 							"Table": "t1",
@@ -244,10 +251,10 @@ func TestWorkflowListStreams(t *testing.T) {
 				}
 			],
 			"TabletControls": null,
-			"MasterIsServing": true
+			"PrimaryIsServing": true
 		},
 		"80-/zone1-0000000210": {
-			"MasterReplicationStatuses": [
+			"PrimaryReplicationStatuses": [
 				{
 					"Shard": "80-",
 					"Tablet": "zone1-0000000210",
@@ -263,13 +270,17 @@ func TestWorkflowListStreams(t *testing.T) {
 							]
 						}
 					},
-					"Pos": "pos",
+					"Pos": "14b68925-696a-11ea-aee7-fec597a91f5e:1-3",
 					"StopPos": "",
 					"State": "Copying",
 					"DBName": "vt_target",
 					"TransactionTimestamp": 0,
 					"TimeUpdated": 1234,
+					"TimeHeartbeat": 1234,
+					"TimeThrottled": 0,
+					"ComponentThrottled": "",
 					"Message": "",
+					"Tags": "",
 					"CopyState": [
 						{
 							"Table": "t1",
@@ -279,9 +290,11 @@ func TestWorkflowListStreams(t *testing.T) {
 				}
 			],
 			"TabletControls": null,
-			"MasterIsServing": true
+			"PrimaryIsServing": true
 		}
-	}
+	},
+	"SourceTimeZone": "",
+	"TargetTimeZone": ""
 }
 
 `
@@ -289,6 +302,8 @@ func TestWorkflowListStreams(t *testing.T) {
 	// MaxVReplicationLag needs to be reset. This can't be determinable in this kind of a test because time.Now() is constantly shifting.
 	re := regexp.MustCompile(`"MaxVReplicationLag": \d+`)
 	got = re.ReplaceAllLiteralString(got, `"MaxVReplicationLag": 0`)
+	re = regexp.MustCompile(`"MaxVReplicationTransactionLag": \d+`)
+	got = re.ReplaceAllLiteralString(got, `"MaxVReplicationTransactionLag": 0`)
 	require.Equal(t, want, got)
 
 	results, err := wr.execWorkflowAction(ctx, workflow, keyspace, "stop", false)
@@ -300,7 +315,7 @@ func TestWorkflowListStreams(t *testing.T) {
 		gotResults = append(gotResults, fmt.Sprintf("%s:%v", key.String(), result))
 	}
 	sort.Strings(gotResults)
-	wantResults := []string{"Tablet{zone1-0000000200}:rows_affected:1 ", "Tablet{zone1-0000000210}:rows_affected:1 "}
+	wantResults := []string{"Tablet{zone1-0000000200}:rows_affected:1", "Tablet{zone1-0000000210}:rows_affected:1"}
 	sort.Strings(wantResults)
 	require.ElementsMatch(t, wantResults, gotResults)
 
@@ -312,15 +327,15 @@ func TestWorkflowListStreams(t *testing.T) {
 will be run on the following streams in keyspace target for workflow wrWorkflow:
 
 
-+----------------------+----+--------------------------------+---------+-----------+--------------+
-|        TABLET        | ID |          BINLOGSOURCE          |  STATE  |  DBNAME   | CURRENT GTID |
-+----------------------+----+--------------------------------+---------+-----------+--------------+
-| -80/zone1-0000000200 |  1 | keyspace:"source" shard:"0"    | Copying | vt_target | pos          |
-|                      |    | filter:<rules:<match:"t1" > >  |         |           |              |
-+----------------------+----+--------------------------------+---------+-----------+--------------+
-| 80-/zone1-0000000210 |  1 | keyspace:"source" shard:"0"    | Copying | vt_target | pos          |
-|                      |    | filter:<rules:<match:"t1" > >  |         |           |              |
-+----------------------+----+--------------------------------+---------+-----------+--------------+
++----------------------+----+--------------------------------+---------+-----------+------------------------------------------+
+|        TABLET        | ID |          BINLOGSOURCE          |  STATE  |  DBNAME   |               CURRENT GTID               |
++----------------------+----+--------------------------------+---------+-----------+------------------------------------------+
+| -80/zone1-0000000200 |  1 | keyspace:"source" shard:"0"    | Copying | vt_target | 14b68925-696a-11ea-aee7-fec597a91f5e:1-3 |
+|                      |    | filter:{rules:{match:"t1"}}    |         |           |                                          |
++----------------------+----+--------------------------------+---------+-----------+------------------------------------------+
+| 80-/zone1-0000000210 |  1 | keyspace:"source" shard:"0"    | Copying | vt_target | 14b68925-696a-11ea-aee7-fec597a91f5e:1-3 |
+|                      |    | filter:{rules:{match:"t1"}}    |         |           |                                          |
++----------------------+----+--------------------------------+---------+-----------+------------------------------------------+
 
 
 

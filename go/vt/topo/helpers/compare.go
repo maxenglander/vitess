@@ -21,9 +21,9 @@ package helpers
 import (
 	"reflect"
 
-	"context"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
+	"context"
 
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo"
@@ -119,7 +119,7 @@ func CompareTablets(ctx context.Context, fromTS, toTS *topo.Server) error {
 	}
 
 	for _, cell := range cells {
-		tabletAliases, err := fromTS.GetTabletsByCell(ctx, cell)
+		tabletAliases, err := fromTS.GetTabletAliasesByCell(ctx, cell)
 		if err != nil {
 			return vterrors.Wrapf(err, "GetTabletsByCell(%v)", cell)
 		}

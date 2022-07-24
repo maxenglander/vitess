@@ -48,6 +48,9 @@ import (
 
 	// register the proper init and shutdown hooks for logging
 	_ "vitess.io/vitess/go/vt/logutil"
+
+	// Include deprecation warnings for soon-to-be-unsupported flag invocations.
+	_flag "vitess.io/vitess/go/internal/flag"
 )
 
 var (
@@ -57,6 +60,7 @@ var (
 	// Flags to alter the behavior of the library.
 	lameduckPeriod = flag.Duration("lameduck-period", 50*time.Millisecond, "keep running at least this long after SIGTERM before stopping")
 	onTermTimeout  = flag.Duration("onterm_timeout", 10*time.Second, "wait no more than this for OnTermSync handlers before stopping")
+	onCloseTimeout = flag.Duration("onclose_timeout", time.Nanosecond, "wait no more than this for OnClose handlers before stopping")
 	_              = flag.Int("mem-profile-rate", 512*1024, "deprecated: use '-pprof=mem' instead")
 	_              = flag.Int("mutex-profile-fraction", 0, "deprecated: use '-pprof=mutex' instead")
 	catchSigpipe   = flag.Bool("catch-sigpipe", false, "catch and ignore SIGPIPE on stdout and stderr if specified")
@@ -165,24 +169,37 @@ func OnTermSync(f func()) {
 
 // fireOnTermSyncHooks returns true iff all the hooks finish before the timeout.
 func fireOnTermSyncHooks(timeout time.Duration) bool {
+	return fireHooksWithTimeout(timeout, "OnTermSync", onTermSyncHooks.Fire)
+}
+
+// fireOnCloseHooks returns true iff all the hooks finish before the timeout.
+func fireOnCloseHooks(timeout time.Duration) bool {
+	return fireHooksWithTimeout(timeout, "OnClose", func() {
+		onCloseHooks.Fire()
+		ListeningURL = url.URL{}
+	})
+}
+
+// fireHooksWithTimeout returns true iff all the hooks finish before the timeout.
+func fireHooksWithTimeout(timeout time.Duration, name string, hookFn func()) bool {
 	defer log.Flush()
-	log.Infof("Firing synchronous OnTermSync hooks and waiting up to %v for them", timeout)
+	log.Infof("Firing %s hooks and waiting up to %v for them", name, timeout)
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	done := make(chan struct{})
 	go func() {
-		onTermSyncHooks.Fire()
+		hookFn()
 		close(done)
 	}()
 
 	select {
 	case <-done:
-		log.Infof("OnTermSync hooks finished")
+		log.Infof("%s hooks finished", name)
 		return true
 	case <-timer.C:
-		log.Infof("OnTermSync hooks timed out")
+		log.Infof("%s hooks timed out", name)
 		return false
 	}
 }
@@ -215,14 +232,14 @@ func RunDefault() {
 // ParseFlags initializes flags and handles the common case when no positional
 // arguments are expected.
 func ParseFlags(cmd string) {
-	flag.Parse()
+	_flag.Parse()
 
 	if *Version {
 		AppVersion.Print()
 		os.Exit(0)
 	}
 
-	args := flag.Args()
+	args := _flag.Args()
 	if len(args) > 0 {
 		flag.Usage()
 		log.Exitf("%s doesn't take any positional arguments, got '%s'", cmd, strings.Join(args, " "))
@@ -231,14 +248,14 @@ func ParseFlags(cmd string) {
 
 // ParseFlagsWithArgs initializes flags and returns the positional arguments
 func ParseFlagsWithArgs(cmd string) []string {
-	flag.Parse()
+	_flag.Parse()
 
 	if *Version {
 		AppVersion.Print()
 		os.Exit(0)
 	}
 
-	args := flag.Args()
+	args := _flag.Args()
 	if len(args) == 0 {
 		log.Exitf("%s expected at least one positional argument", cmd)
 	}

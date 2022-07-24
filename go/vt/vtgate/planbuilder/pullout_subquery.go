@@ -88,11 +88,11 @@ func (ps *pulloutSubquery) Wireup(plan logicalPlan, jt *jointab) error {
 }
 
 // Wireup2 implements the logicalPlan interface
-func (ps *pulloutSubquery) WireupV4(semTable *semantics.SemTable) error {
-	if err := ps.underlying.WireupV4(semTable); err != nil {
+func (ps *pulloutSubquery) WireupGen4(semTable *semantics.SemTable) error {
+	if err := ps.underlying.WireupGen4(semTable); err != nil {
 		return err
 	}
-	return ps.subquery.WireupV4(semTable)
+	return ps.subquery.WireupGen4(semTable)
 }
 
 // SupplyVar implements the logicalPlan interface
@@ -110,8 +110,8 @@ func (ps *pulloutSubquery) SupplyCol(col *sqlparser.ColName) (rc *resultColumn, 
 }
 
 // SupplyWeightString implements the logicalPlan interface
-func (ps *pulloutSubquery) SupplyWeightString(colNumber int) (weightcolNumber int, err error) {
-	return ps.underlying.SupplyWeightString(colNumber)
+func (ps *pulloutSubquery) SupplyWeightString(colNumber int, alsoAddToGroupBy bool) (weightcolNumber int, err error) {
+	return ps.underlying.SupplyWeightString(colNumber, alsoAddToGroupBy)
 }
 
 // Rewrite implements the logicalPlan interface
@@ -124,7 +124,7 @@ func (ps *pulloutSubquery) Rewrite(inputs ...logicalPlan) error {
 	return nil
 }
 
-// Solves implements the logicalPlan interface
+// ContainsTables implements the logicalPlan interface
 func (ps *pulloutSubquery) ContainsTables() semantics.TableSet {
 	return ps.underlying.ContainsTables().Merge(ps.subquery.ContainsTables())
 }
@@ -132,4 +132,9 @@ func (ps *pulloutSubquery) ContainsTables() semantics.TableSet {
 // Inputs implements the logicalPlan interface
 func (ps *pulloutSubquery) Inputs() []logicalPlan {
 	return []logicalPlan{ps.underlying, ps.subquery}
+}
+
+// OutputColumns implements the logicalPlan interface
+func (ps *pulloutSubquery) OutputColumns() []sqlparser.SelectExpr {
+	return ps.underlying.OutputColumns()
 }

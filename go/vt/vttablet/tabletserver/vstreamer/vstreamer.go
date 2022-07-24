@@ -19,15 +19,15 @@ package vstreamer
 import (
 	"bytes"
 	"context"
-	"flag"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
-	vtschema "vitess.io/vitess/go/vt/schema"
+	"google.golang.org/protobuf/encoding/prototext"
 
-	"github.com/golang/protobuf/proto"
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/timer"
+	vtschema "vitess.io/vitess/go/vt/schema"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
@@ -42,8 +42,11 @@ import (
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
-// PacketSize is the suggested packet size for VReplication streamer.
-var PacketSize = flag.Int("vstream_packet_size", 250000, "Suggested packet size for VReplication streamer. This is used only as a recommendation. The actual packet size may be more or less than this amount.")
+const (
+	trxHistoryLenQuery = `select count as history_len from information_schema.INNODB_METRICS where name = 'trx_rseg_history_len'`
+	replicaLagQuery    = `show slave status`
+	hostQuery          = `select @@hostname as hostname, @@port as port`
+)
 
 // HeartbeatTime is set to slightly below 1s, compared to idleTimeout
 // set by VPlayer at slightly above 1s. This minimizes conflicts
@@ -84,9 +87,6 @@ type vstreamer struct {
 	vse   *Engine
 }
 
-// CopyState contains the last PK for tables to be copied
-type CopyState map[string][]*sqltypes.Result
-
 // streamerPlan extends the original plan to also include
 // the TableMap, which comes from the binlog. It's used
 // to extract values from the ROW events.
@@ -109,7 +109,7 @@ type streamerPlan struct {
 //   "select * from t where in_keyrange(col1, 'hash', '-80')",
 //   "select col1, col2 from t where...",
 //   "select col1, keyspace_id() from t where...".
-//   Only "in_keyrange" expressions are supported in the where clause.
+//   Only "in_keyrange" and limited comparison operators (see enum Opcode in planbuilder.go) are supported in the where clause.
 //   Other constructs like joins, group by, etc. are not supported.
 // vschema: the current vschema. This value can later be changed through the SetVSchema method.
 // send: callback function to send events.
@@ -193,6 +193,7 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 		bufferedEvents []*binlogdatapb.VEvent
 		curSize        int
 	)
+
 	// Only the following patterns are possible:
 	// BEGIN->ROWs or Statements->GTID->COMMIT. In the case of large transactions, this can be broken into chunks.
 	// BEGIN->JOURNAL->GTID->COMMIT
@@ -207,6 +208,9 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 	// all existing rows are sent without the new row.
 	// If a single row exceeds the packet size, it will be in its own packet.
 	bufferAndTransmit := func(vevent *binlogdatapb.VEvent) error {
+		vevent.Keyspace = vs.vse.keyspace
+		vevent.Shard = vs.vse.shard
+
 		switch vevent.Type {
 		case binlogdatapb.VEventType_GTID, binlogdatapb.VEventType_BEGIN, binlogdatapb.VEventType_FIELD,
 			binlogdatapb.VEventType_JOURNAL:
@@ -227,7 +231,7 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 			return vs.send(vevents)
 		case binlogdatapb.VEventType_INSERT, binlogdatapb.VEventType_DELETE, binlogdatapb.VEventType_UPDATE, binlogdatapb.VEventType_REPLACE:
 			newSize := len(vevent.GetDml())
-			if curSize+newSize > *PacketSize {
+			if curSize+newSize > *defaultPacketSize {
 				vs.vse.vstreamerNumPackets.Add(1)
 				vevents := bufferedEvents
 				bufferedEvents = []*binlogdatapb.VEvent{vevent}
@@ -248,7 +252,7 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 					newSize += len(rowChange.After.Values)
 				}
 			}
-			if curSize+newSize > *PacketSize {
+			if curSize+newSize > *defaultPacketSize {
 				vs.vse.vstreamerNumPackets.Add(1)
 				vevents := bufferedEvents
 				bufferedEvents = []*binlogdatapb.VEvent{vevent}
@@ -256,8 +260,6 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 				return vs.send(vevents)
 			}
 			curSize += newSize
-			bufferedEvents = append(bufferedEvents, vevent)
-		case binlogdatapb.VEventType_SAVEPOINT:
 			bufferedEvents = append(bufferedEvents, vevent)
 		default:
 			vs.vse.errorCounts.Add("BufferAndTransmit", 1)
@@ -267,34 +269,66 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 	}
 
 	// Main loop: calls bufferAndTransmit as events arrive.
-	timer := time.NewTimer(HeartbeatTime)
-	defer timer.Stop()
+	hbTimer := time.NewTimer(HeartbeatTime)
+	defer hbTimer.Stop()
 
+	injectHeartbeat := func(throttled bool) error {
+		now := time.Now().UnixNano()
+		err := bufferAndTransmit(&binlogdatapb.VEvent{
+			Type:        binlogdatapb.VEventType_HEARTBEAT,
+			Timestamp:   now / 1e9,
+			CurrentTime: now,
+			Throttled:   throttled,
+		})
+		return err
+	}
+
+	throttleEvents := func(throttledEvents chan mysql.BinlogEvent) {
+		throttledHeartbeatsRateLimiter := timer.NewRateLimiter(HeartbeatTime)
+		for {
+			// check throttler.
+			if !vs.vse.throttlerClient.ThrottleCheckOKOrWait(ctx) {
+				// make sure to leave if context is cancelled
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					// do nothing special
+				}
+				throttledHeartbeatsRateLimiter.Do(func() error {
+					return injectHeartbeat(true)
+				})
+				// we won't process events, until we're no longer throttling
+				continue
+			}
+			select {
+			case ev, ok := <-events:
+				if ok {
+					select {
+					case throttledEvents <- ev:
+					case <-ctx.Done():
+						return
+					}
+				} else {
+					close(throttledEvents)
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 	// throttledEvents can be read just like you would read from events
 	// throttledEvents pulls data from events, but throttles pulling data,
 	// which in turn blocks the BinlogConnection from pushing events to the channel
 	throttledEvents := make(chan mysql.BinlogEvent)
-	go func() {
-		for {
-			// check throttler.
-			if !vs.vse.throttlerClient.ThrottleCheckOKOrWait(ctx) {
-				continue
-			}
+	go throttleEvents(throttledEvents)
 
-			ev, ok := <-events
-			if ok {
-				throttledEvents <- ev
-			} else {
-				close(throttledEvents)
-				return
-			}
-		}
-	}()
 	for {
-		timer.Reset(HeartbeatTime)
+		hbTimer.Reset(HeartbeatTime)
 		// Drain event if timer fired before reset.
 		select {
-		case <-timer.C:
+		case <-hbTimer.C:
 		default:
 		}
 
@@ -330,13 +364,8 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 			vschemaUpdateCount.Add(1)
 		case <-ctx.Done():
 			return nil
-		case <-timer.C:
-			now := time.Now().UnixNano()
-			if err := bufferAndTransmit(&binlogdatapb.VEvent{
-				Type:        binlogdatapb.VEventType_HEARTBEAT,
-				Timestamp:   now / 1e9,
-				CurrentTime: now,
-			}); err != nil {
+		case <-hbTimer.C:
+			if err := injectHeartbeat(false); err != nil {
 				if err == io.EOF {
 					return nil
 				}
@@ -369,7 +398,7 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 	// tells us the size of the event header.
 	if vs.format.IsZero() {
 		// The only thing that should come before the FORMAT_DESCRIPTION_EVENT
-		// is a fake ROTATE_EVENT, which the master sends to tell us the name
+		// is a fake ROTATE_EVENT, which the primary sends to tell us the name
 		// of the current log file.
 		if ev.IsRotate() {
 			return nil, nil
@@ -395,7 +424,7 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 				Type: binlogdatapb.VEventType_BEGIN,
 			})
 		}
-		vs.pos = mysql.AppendGTID(vs.pos, gtid) //TODO: #sugu why Append?
+		vs.pos = mysql.AppendGTID(vs.pos, gtid)
 	case ev.IsXID():
 		vevents = append(vevents, &binlogdatapb.VEvent{
 			Type: binlogdatapb.VEventType_GTID,
@@ -470,15 +499,19 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 					Type: binlogdatapb.VEventType_OTHER,
 				})
 			}
-			vs.se.ReloadAt(context.Background(), vs.pos)
-		case sqlparser.StmtSavepoint:
-			mustSend := mustSendStmt(q, vs.cp.DBName())
-			if mustSend {
-				vevents = append(vevents, &binlogdatapb.VEvent{
-					Type:      binlogdatapb.VEventType_SAVEPOINT,
-					Statement: q.SQL,
-				})
+			if schema.MustReloadSchemaOnDDL(q.SQL, vs.cp.DBName()) {
+				vs.se.ReloadAt(context.Background(), vs.pos)
 			}
+		case sqlparser.StmtSavepoint:
+			// We currently completely skip `SAVEPOINT ...` statements.
+			//
+			// MySQL inserts `SAVEPOINT ...` statements into the binlog in row based, statement based
+			// and in mixed replication modes, but only ever writes `ROLLBACK TO ...` statements to the
+			// binlog in mixed or statement based replication modes. Without `ROLLBACK TO ...` statements,
+			// savepoints are side-effect free.
+			//
+			// Vitess only supports row based replication, so skipping the creation of savepoints
+			// reduces the amount of data send over to vplayer.
 		case sqlparser.StmtOther, sqlparser.StmtPriv, sqlparser.StmtSet, sqlparser.StmtComment, sqlparser.StmtFlush:
 			// These are either:
 			// 1) DBA statements like REPAIR that can be ignored.
@@ -502,14 +535,23 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 		// will generate a new plan and FIELD event.
 		id := ev.TableID(vs.format)
 
-		if _, ok := vs.plans[id]; ok {
-			return nil, nil
-		}
-
 		tm, err := ev.TableMap(vs.format)
 		if err != nil {
 			return nil, err
 		}
+
+		if plan, ok := vs.plans[id]; ok {
+			// When the underlying mysql server restarts the table map can change.
+			// Usually the vstreamer will also error out when this happens, and vstreamer re-initializes its table map.
+			// But if the vstreamer is not aware of the restart, we could get an id that matches one in the cache, but
+			// is for a different table. We then invalidate and recompute the plan for this id.
+			if plan == nil || plan.Table.Name == tm.Name {
+				return nil, nil
+			}
+			vs.plans[id] = nil
+			log.Infof("table map changed: id %d for %s has changed to %s", id, plan.Table.Name, tm.Name)
+		}
+
 		if tm.Database == "_vt" && tm.Name == "resharding_journal" {
 			// A journal is a special case that generates a JOURNAL event.
 			return nil, vs.buildJournalPlan(id, tm)
@@ -590,7 +632,7 @@ func (vs *vstreamer) buildJournalPlan(id uint64, tm *mysql.TableMap) error {
 	}
 	fields := qr.Fields
 	if len(fields) < len(tm.Types) {
-		return fmt.Errorf("cannot determine table columns for %s: event has %v, schema as %v", tm.Name, tm.Types, fields)
+		return fmt.Errorf("cannot determine table columns for %s: event has %v, schema has %v", tm.Name, tm.Types, fields)
 	}
 	table := &Table{
 		Name:   "_vt.resharding_journal",
@@ -623,7 +665,7 @@ func (vs *vstreamer) buildVersionPlan(id uint64, tm *mysql.TableMap) error {
 	}
 	fields := qr.Fields
 	if len(fields) < len(tm.Types) {
-		return fmt.Errorf("cannot determine table columns for %s: event has %v, schema as %v", tm.Name, tm.Types, fields)
+		return fmt.Errorf("cannot determine table columns for %s: event has %v, schema has %v", tm.Name, tm.Types, fields)
 	}
 	table := &Table{
 		Name:   "_vt.schema_version",
@@ -671,6 +713,8 @@ func (vs *vstreamer) buildTablePlan(id uint64, tm *mysql.TableMap) (*binlogdatap
 		FieldEvent: &binlogdatapb.FieldEvent{
 			TableName: plan.Table.Name,
 			Fields:    plan.fields(),
+			Keyspace:  vs.vse.keyspace,
+			Shard:     vs.vse.shard,
 		},
 	}, nil
 }
@@ -687,7 +731,7 @@ func (vs *vstreamer) buildTableColumns(tm *mysql.TableMap) ([]*querypb.Field, er
 			Type: t,
 		})
 	}
-	st, err := vs.se.GetTableForPos(sqlparser.NewTableIdent(tm.Name), mysql.EncodePosition(vs.pos))
+	st, err := vs.se.GetTableForPos(sqlparser.NewIdentifierCS(tm.Name), mysql.EncodePosition(vs.pos))
 	if err != nil {
 		if vs.filter.FieldEventMode == binlogdatapb.Filter_ERR_ON_MISMATCH {
 			log.Infof("No schema found for table %s", tm.Name)
@@ -699,7 +743,7 @@ func (vs *vstreamer) buildTableColumns(tm *mysql.TableMap) ([]*querypb.Field, er
 	if len(st.Fields) < len(tm.Types) {
 		if vs.filter.FieldEventMode == binlogdatapb.Filter_ERR_ON_MISMATCH {
 			log.Infof("Cannot determine columns for table %s", tm.Name)
-			return nil, fmt.Errorf("cannot determine table columns for %s: event has %v, schema as %v", tm.Name, tm.Types, st.Fields)
+			return nil, fmt.Errorf("cannot determine table columns for %s: event has %v, schema has %v", tm.Name, tm.Types, st.Fields)
 		}
 		return fields, nil
 	}
@@ -718,11 +762,13 @@ func (vs *vstreamer) buildTableColumns(tm *mysql.TableMap) ([]*querypb.Field, er
 		return nil, err
 	}
 	for _, field := range fields {
-		typ := strings.ToLower(field.Type.String())
-		if typ == "enum" || typ == "set" {
-			if extColInfo, ok := extColInfos[field.Name]; ok {
-				field.ColumnType = extColInfo.columnType
-			}
+		// we want the MySQL column type info so that we can properly handle
+		// ambiguous binlog events and other cases where the internal types
+		// don't match the MySQL column type. One example being that in binlog
+		// events CHAR columns with a binary collation are indistinguishable
+		// from BINARY columns.
+		if extColInfo, ok := extColInfos[field.Name]; ok {
+			field.ColumnType = extColInfo.columnType
 		}
 	}
 	return fields, nil
@@ -789,7 +835,11 @@ nextrow:
 				continue
 			}
 			journal := &binlogdatapb.Journal{}
-			if err := proto.UnmarshalText(afterValues[i].ToString(), journal); err != nil {
+			avBytes, err := afterValues[i].ToBytes()
+			if err != nil {
+				return nil, err
+			}
+			if err := prototext.Unmarshal(avBytes, journal); err != nil {
 				return nil, err
 			}
 			vevents = append(vevents, &binlogdatapb.VEvent{
@@ -830,6 +880,8 @@ func (vs *vstreamer) processRowEvent(vevents []*binlogdatapb.VEvent, plan *strea
 			RowEvent: &binlogdatapb.RowEvent{
 				TableName:  plan.Table.Name,
 				RowChanges: rowChanges,
+				Keyspace:   vs.vse.keyspace,
+				Shard:      vs.vse.shard,
 			},
 		})
 	}
@@ -863,6 +915,7 @@ func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataCo
 		return false, nil, nil
 	}
 	values := make([]sqltypes.Value, dataColumns.Count())
+	charsets := make([]collations.ID, len(values))
 	valueIndex := 0
 	pos := 0
 	for colNum := 0; colNum < dataColumns.Count(); colNum++ {
@@ -873,15 +926,21 @@ func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataCo
 			valueIndex++
 			continue
 		}
-		value, l, err := mysql.CellValue(data, pos, plan.TableMap.Types[colNum], plan.TableMap.Metadata[colNum], plan.Table.Fields[colNum].Type)
+		value, l, err := mysql.CellValue(data, pos, plan.TableMap.Types[colNum], plan.TableMap.Metadata[colNum], plan.Table.Fields[colNum])
 		if err != nil {
+			log.Errorf("extractRowAndFilter: %s, table: %s, colNum: %d, fields: %+v, current values: %+v",
+				err, plan.Table.Name, colNum, plan.Table.Fields, values)
 			return false, nil, err
 		}
 		pos += l
+
+		charsets[colNum] = collations.ID(plan.Table.Fields[colNum].Charset)
 		values[colNum] = value
 		valueIndex++
 	}
-	return plan.filter(values)
+	filtered := make([]sqltypes.Value, len(plan.ColExprs))
+	ok, err := plan.filter(values, filtered, charsets)
+	return ok, filtered, err
 }
 
 func wrapError(err error, stopPos mysql.Position, vse *Engine) error {

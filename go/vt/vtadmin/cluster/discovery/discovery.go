@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/spf13/pflag"
 
@@ -52,6 +53,10 @@ type Discovery interface {
 	// return an address is not specified by the interface, and can be
 	// implementation-specific.
 	DiscoverVTGateAddr(ctx context.Context, tags []string) (string, error)
+	// DiscoverVTGateAddrs returns a list of addresses of vtgates found in the
+	// discovery service. This is semantically equivalent to the result of
+	// DiscoverVTGateAddr for each gate returned by a call to DiscoverVTGates.
+	DiscoverVTGateAddrs(ctx context.Context, tags []string) ([]string, error)
 	// DiscoverVTGates returns a list of vtgates found in the discovery service.
 	// Tags can optionally be used to filter gates. Order of the gates is not
 	// specified by the interface, and can be implementation-specific.
@@ -67,6 +72,10 @@ type Discovery interface {
 	// return an address is not specified by the interface, and can be
 	// implementation-specific.
 	DiscoverVtctldAddr(ctx context.Context, tags []string) (string, error)
+	// DiscoverVtctldAddrs returns a list of addresses of vtctlds found in the
+	// discovery service. This is semantically equivalent to the result of
+	// DiscoverVtctldAddr for each gate returned by a call to DiscoverVtctlds.
+	DiscoverVtctldAddrs(ctx context.Context, tags []string) ([]string, error)
 	// DiscoverVtctlds returns a list of vtctlds found in the discovery service.
 	// Tags can optionally be used to filter vtctlds. Order of the vtctlds is
 	// not specified by the interface, and can be implementation-specific.
@@ -82,11 +91,15 @@ type Factory func(cluster *vtadminpb.Cluster, flags *pflag.FlagSet, args []strin
 
 // nolint:gochecknoglobals
 var registry = map[string]Factory{}
+var registryMu sync.Mutex
 
 // Register registers a factory for the given implementation name. Attempting
 // to register multiple factories for the same implementation name causes a
 // panic.
 func Register(name string, factory Factory) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
 	_, ok := registry[name]
 	if ok {
 		panic("[discovery] factory already registered for " + name)
@@ -99,7 +112,10 @@ func Register(name string, factory Factory) {
 // implementation. Usage of the args slice is dependent on the implementation's
 // factory.
 func New(impl string, cluster *vtadminpb.Cluster, args []string) (Discovery, error) {
+	registryMu.Lock()
 	factory, ok := registry[impl]
+	registryMu.Unlock()
+
 	if !ok {
 		return nil, fmt.Errorf("%w %s", ErrImplementationNotRegistered, impl)
 	}
@@ -110,4 +126,5 @@ func New(impl string, cluster *vtadminpb.Cluster, args []string) (Discovery, err
 func init() { // nolint:gochecknoinits
 	Register("consul", NewConsul)
 	Register("staticfile", NewStaticFile)
+	Register("dynamic", NewDynamic)
 }
