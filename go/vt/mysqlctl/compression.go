@@ -40,6 +40,7 @@ const (
 	PgzipCompressor    = "pgzip"
 	PargzipCompressor  = "pargzip"
 	ZstdCompressor     = "zstd"
+	ZstdcCompressor    = "zstdc"
 	Lz4Compressor      = "lz4"
 	ExternalCompressor = "external"
 )
@@ -104,6 +105,10 @@ func validateExternalCompressionEngineName(engine string) error {
 	case PargzipCompressor:
 	case Lz4Compressor:
 	case ZstdCompressor:
+	case ZstdcCompressor:
+		if !isZstdcSupported() {
+			return fmt.Errorf("%w value: %q", errUnsupportedCompressionEngine, engine)
+		}
 	case ExternalCompressor:
 	default:
 		return fmt.Errorf("%w value: %q", errUnsupportedCompressionEngine, engine)
@@ -212,6 +217,8 @@ func newBuiltinDecompressor(engine string, reader io.Reader, logger logutil.Logg
 			return nil, err
 		}
 		decompressor = d.IOReadCloser()
+	case ZstdcCompressor:
+		return newZstdcDecompressor(reader)
 	default:
 		err = fmt.Errorf("Unkown decompressor engine: %q", engine)
 		return decompressor, err
@@ -249,6 +256,8 @@ func newBuiltinCompressor(engine string, writer io.Writer, logger logutil.Logger
 			return compressor, vterrors.Wrap(err, "cannot create zstd compressor")
 		}
 		compressor = zst
+	case ZstdcCompressor:
+		return  newZstdcCompressor(writer)
 	default:
 		err = fmt.Errorf("%w value: %q", errUnsupportedCompressionEngine, engine)
 		return compressor, err

@@ -87,7 +87,7 @@ endif
 	bash ./build.env
 	# build all the binaries by default with CGO disabled.
 	# Binaries will be placed in ${VTROOTBIN}.
-	CGO_ENABLED=0 go build \
+	CGO_ENABLED=1 CGO_LDFLAGS="-no-pie" go build \
 		    -trimpath $(EXTRA_BUILD_FLAGS) $(VT_GO_PARALLEL) \
 		    -ldflags "$(shell tools/build_version_flags.sh)" \
 		    -o ${VTROOTBIN} ./go/...
@@ -111,7 +111,7 @@ endif
 	# with CGO disabled. Binaries will be placed in
 	# ${VTROOTBIN}/${GOOS}_${GOARG}.
 	mkdir -p ${VTROOTBIN}/${GOOS}_${GOARCH}
-	CGO_ENABLED=0 GOOS=${GOOS} GOARCH=${GOARCH} go build         \
+	CGO_ENABLED=1 GOOS=${GOOS} GOARCH=${GOARCH} go build         \
 		    -trimpath $(EXTRA_BUILD_FLAGS) $(VT_GO_PARALLEL) \
 		    -ldflags "$(shell tools/build_version_flags.sh)" \
 		    -o ${VTROOTBIN}/${GOOS}_${GOARCH} ./go/...
@@ -316,7 +316,7 @@ define build_docker_image
 		docker buildx build --platform linux/arm64 -f ${1} -t ${2} --build-arg bootstrap_version=${BOOTSTRAP_VERSION} .; \
 	else \
 		echo "Building docker using straight docker build"; \
-		docker build -f ${1} -t ${2} --build-arg bootstrap_version=${BOOTSTRAP_VERSION} .; \
+		docker buildx build --platform linux/amd64 -f ${1} -t ${2} --build-arg bootstrap_version=${BOOTSTRAP_VERSION} .; \
 	fi
 endef
 
